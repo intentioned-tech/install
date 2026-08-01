@@ -1,0 +1,30 @@
+Intentioned.tech Installer
+
+Copyright (c) 2025-2026 Ari Kotler. All rights reserved.
+
+PERMISSION TO USE THIS INSTALLER
+
+Permission is granted to any person to use, copy, and redistribute this
+installer script ("install.sh") verbatim, for the sole purpose of installing
+Intentioned.tech. You may inspect and modify it for your own local use.
+
+THIS DOES NOT LICENSE THE APPLICATION
+
+Intentioned.tech, the software this script installs, is proprietary and is NOT
+covered by this permission. Downloading and running it requires a valid licence
+issued by the copyright holder. Nothing here grants any right to the
+application, its source code, or its compiled builds, and this permission does
+not extend to circumventing or reimplementing the licence check.
+
+Third-party open-source components bundled with the application retain their own
+licences and are credited in the THIRD_PARTY_LICENSES file distributed with each
+release.
+
+NO WARRANTY
+
+THIS SCRIPT IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THIS SCRIPT OR ITS USE.

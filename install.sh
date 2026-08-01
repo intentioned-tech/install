@@ -1,0 +1,844 @@
+#!/bin/bash
+# Intentioned.tech - Linux/macOS Installation Script
+# Run with: bash install.sh
+
+set -e
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+# Default installation path
+INSTALL_PATH="${INSTALL_PATH:-$HOME/.local/share/intentioned}"
+OPEN_CONFIG=true
+INSTALL_BACKEND="${INSTALL_BACKEND:-auto}"
+INSTALL_LLAMA_CPP=true
+GGUF_MODEL=""
+SKIP_REPO_DOWNLOAD=false
+REPO_PATH_CLI=""
+
+# Where the build comes from: "release" pulls the compiled build this licence is
+# entitled to from private R2 through the licence Worker; "git" clones the
+# source (maintainers only); "local" uses an existing checkout or dist.
+SOURCE_MODE="release"
+# Default MUST be a hostname that actually resolves, or every public install
+# fails at the entitlement check. license.intentioned.tech is NXDOMAIN as of
+# this writing; the deployed Worker answers on its workers.dev hostname.
+# Point this at a custom domain once one is created and routed to the Worker.
+WORKER_URL="${INTENTIONED_WORKER_URL:-https://intentioned-license-credentials.jansherremway.workers.dev}"
+REL_USERNAME="${INTENTIONED_USERNAME:-}"
+REL_PASSWORD="${INTENTIONED_PASSWORD:-}"
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --no-config)
+            OPEN_CONFIG=false
+            shift
+            ;;
+        --backend)
+            INSTALL_BACKEND="$2"
+            shift 2
+            ;;
+        --install-path)
+            INSTALL_PATH="$2"
+            shift 2
+            ;;
+        --skip-repo-download)
+            SKIP_REPO_DOWNLOAD=true
+            SOURCE_MODE="local"
+            shift
+            ;;
+        --from-git)
+            SOURCE_MODE="git"
+            shift
+            ;;
+        --username)
+            REL_USERNAME="$2"
+            shift 2
+            ;;
+        --password)
+            # Prefer INTENTIONED_PASSWORD: an argument is visible in /proc to
+            # every local user for the lifetime of the process.
+            REL_PASSWORD="$2"
+            shift 2
+            ;;
+        --worker-url)
+            WORKER_URL="$2"
+            shift 2
+            ;;
+        --repo-path)
+            REPO_PATH_CLI="$2"
+            shift 2
+            ;;
+        --no-llama-cpp)
+            INSTALL_LLAMA_CPP=false
+            shift
+            ;;
+        --gguf)
+            GGUF_MODEL="$2"
+            shift 2
+            ;;
+        -h|--help)
+            echo "Intentioned.tech Installer"
+            echo ""
+            echo "Usage: bash install.sh [OPTIONS]"
+            echo ""
+            echo "Options:"
+            echo "  --install-path PATH   Set custom installation path"
+            echo "  --backend BACKEND     PyTorch backend: auto, cuda, rocm, or cpu"
+            echo "  --username USER       Licence username (or \$INTENTIONED_USERNAME)"
+            echo "  --password PASS       Licence password (prefer \$INTENTIONED_PASSWORD;"
+            echo "                        an argument is readable via /proc by any local user)"
+            echo "  --worker-url URL      Licence server (default: the hosted Worker,"
+            echo "                        or \$INTENTIONED_WORKER_URL)"
+            echo "  --from-git            MAINTAINERS ONLY: clone the (private) source repo"
+            echo "                        licensed build. Maintainers only."
+            echo "  --skip-repo-download  Skip step [5/7] entirely. Use the current directory"
+            echo "                        as the repo (or pass --repo-path)."
+            echo "  --repo-path PATH      With --skip-repo-download only: use this checkout instead of \$PWD"
+            echo "  --no-config           Skip opening config tool after install"
+            echo "  --no-llama-cpp        Skip building llama-cpp-python (GGUF support)"
+            echo "  --gguf REPO[:FILE]    Configure a GGUF model as the LLM"
+            echo "                        e.g. bartowski/Qwen2.5-3B-Instruct-GGUF:*Q4_K_M*.gguf"
+            echo "                        or /abs/path/to/file.gguf"
+            echo "  -h, --help            Show this help message"
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            exit 1
+            ;;
+    esac
+done
+
+echo -e "${CYAN}"
+echo "╔═══════════════════════════════════════════════════════════════╗"
+echo "║         Intentioned.tech - Social Skills Training Platform         ║"
+echo "║                  Linux/macOS Installer v1.0                   ║"
+echo "╚═══════════════════════════════════════════════════════════════╝"
+echo -e "${NC}"
+
+# Detect OS
+OS="$(uname -s)"
+case "${OS}" in
+    Linux*)     PLATFORM=Linux;;
+    Darwin*)    PLATFORM=macOS;;
+    *)          PLATFORM="UNKNOWN:${OS}"
+esac
+echo -e "${YELLOW}Detected platform: ${PLATFORM}${NC}"
+
+# Function to check if command exists
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+detect_backend() {
+    case "${INSTALL_BACKEND,,}" in
+        auto|"")
+            if command_exists nvidia-smi; then
+                echo "cuda"
+            elif command_exists rocm-smi || command_exists rocminfo; then
+                echo "rocm"
+            else
+                echo "cpu"
+            fi
+            ;;
+        cuda|rocm|cpu)
+            echo "${INSTALL_BACKEND,,}"
+            ;;
+        *)
+            echo -e "${RED}Unknown backend '${INSTALL_BACKEND}'. Use auto, cuda, rocm, or cpu.${NC}" >&2
+            exit 1
+            ;;
+    esac
+}
+
+# Check for Python
+#
+# 3.12 EXACTLY, not "3.10 or newer". Kokoro TTS and NeMo/Parakeet both require
+# 3.12 (see the header of requirements.txt), and the Cython dist ships
+# `cpython-312-*.so` modules that will not load under any other minor version.
+#
+# Resolving this by version rather than by the name `python3` matters on
+# rolling-release distros: `python3` there tracks the newest interpreter (3.14
+# at time of writing), which sails past a ">= 3.10" test and then produces a
+# venv nothing in this project can use. The failure surfaces much later as an
+# unrelated-looking import error, so check it here instead.
+echo -e "\n${YELLOW}[1/7] Checking Python installation...${NC}"
+
+is_py312() {
+    [ -x "$1" ] || command_exists "$1" || return 1
+    "$1" -c 'import sys; sys.exit(0 if sys.version_info[:2] == (3, 12) else 1)' 2>/dev/null
+}
+
+PYTHON_BIN=""
+# $INTENTIONED_PYTHON wins, then the versioned name, then whatever `python3`
+# happens to be, then a pyenv install. pyenv is checked last because a shim on
+# PATH is less predictable than an absolute interpreter path.
+for _cand in "${INTENTIONED_PYTHON:-}" python3.12 python3 python; do
+    [ -n "$_cand" ] || continue
+    if is_py312 "$_cand"; then PYTHON_BIN="$(command -v "$_cand" || echo "$_cand")"; break; fi
+done
+if [ -z "$PYTHON_BIN" ] && [ -d "$HOME/.pyenv/versions" ]; then
+    for _p in "$HOME"/.pyenv/versions/3.12.*/bin/python3.12; do
+        if is_py312 "$_p"; then PYTHON_BIN="$_p"; break; fi
+    done
+fi
+
+if [ -z "$PYTHON_BIN" ]; then
+    echo -e "${RED}   Python 3.12 is required and was not found.${NC}"
+    echo -e "${RED}   Kokoro TTS and NeMo/Parakeet need 3.12 specifically — not 3.11, not 3.13+.${NC}"
+    if command_exists python3; then
+        echo -e "${YELLOW}   (python3 on this system is $(python3 --version 2>&1 | cut -d' ' -f2).)${NC}"
+    fi
+    echo -e "${YELLOW}   Install it, then re-run — or point the installer at an existing one:${NC}"
+    echo -e "${YELLOW}       INTENTIONED_PYTHON=/path/to/python3.12 bash install.sh${NC}"
+    if [ "$PLATFORM" = "Linux" ]; then
+        if command_exists apt-get; then
+            echo -e "${YELLOW}       sudo apt-get install -y python3.12 python3.12-venv${NC}"
+        elif command_exists dnf; then
+            echo -e "${YELLOW}       sudo dnf install -y python3.12${NC}"
+        elif command_exists pacman; then
+            # Arch/CachyOS drop old minors from the repos; the AUR package or
+            # pyenv is the realistic route once 3.12 is no longer current.
+            echo -e "${YELLOW}       yay -S python312     # or: pyenv install 3.12${NC}"
+        fi
+    elif [ "$PLATFORM" = "macOS" ]; then
+        echo -e "${YELLOW}       brew install python@3.12${NC}"
+    fi
+    exit 1
+fi
+echo -e "${GREEN}   Found: $("$PYTHON_BIN" --version 2>&1) at $PYTHON_BIN ✓${NC}"
+
+# Check for Git
+echo -e "\n${YELLOW}[2/7] Checking Git installation...${NC}"
+if command_exists git; then
+    GIT_VERSION=$(git --version)
+    echo -e "${GREEN}   Found: $GIT_VERSION ✓${NC}"
+else
+    echo -e "${YELLOW}   Git not found. Installing...${NC}"
+    if [ "$PLATFORM" = "Linux" ]; then
+        if command_exists apt-get; then
+            sudo apt-get install -y git
+        elif command_exists dnf; then
+            sudo dnf install -y git
+        elif command_exists pacman; then
+            sudo pacman -S --noconfirm git
+        fi
+    elif [ "$PLATFORM" = "macOS" ]; then
+        brew install git
+    fi
+fi
+
+# Check for ffmpeg
+echo -e "\n${YELLOW}[3/7] Checking ffmpeg installation...${NC}"
+if command_exists ffmpeg; then
+    FFMPEG_VERSION=$(ffmpeg -version 2>&1 | head -n1)
+    echo -e "${GREEN}   Found: $FFMPEG_VERSION ✓${NC}"
+else
+    echo -e "${YELLOW}   ffmpeg not found. Installing...${NC}"
+    if [ "$PLATFORM" = "Linux" ]; then
+        if command_exists apt-get; then
+            sudo apt-get install -y ffmpeg
+        elif command_exists dnf; then
+            sudo dnf install -y ffmpeg
+        elif command_exists pacman; then
+            sudo pacman -S --noconfirm ffmpeg
+        fi
+    elif [ "$PLATFORM" = "macOS" ]; then
+        brew install ffmpeg
+    fi
+fi
+
+# Create installation directory
+echo -e "\n${YELLOW}[4/7] Creating installation directory...${NC}"
+mkdir -p "$INSTALL_PATH"
+echo -e "${GREEN}   Path: $INSTALL_PATH ✓${NC}"
+
+# Clone or update repository
+if [ "$SKIP_REPO_DOWNLOAD" = true ]; then
+    if [ -n "$REPO_PATH_CLI" ]; then
+        REPO_PATH="$(cd "$REPO_PATH_CLI" && pwd -P)"
+    else
+        REPO_PATH="$(pwd -P)"
+    fi
+    echo -e "\n${YELLOW}[5/7] Skipping repository download (--skip-repo-download)${NC}"
+    if [ ! -f "$REPO_PATH/requirements.txt" ]; then
+        echo -e "${RED}   No project checkout at:${NC}"
+        echo -e "${RED}   $REPO_PATH${NC}" >&2
+        echo -e "${YELLOW}   cd into the intentioned.tech repo and run again, or use:${NC}"
+        echo -e "${YELLOW}     --skip-repo-download --repo-path /path/to/intentioned.tech${NC}" >&2
+        exit 1
+    fi
+    echo -e "${GREEN}   Using existing repo: $REPO_PATH ✓${NC}"
+elif [ "$SOURCE_MODE" = "git" ]; then
+    # Maintainer path only: this clones the full proprietary source. It is NOT
+    # how a customer installs — see the release path below.
+    if [ -n "$REPO_PATH_CLI" ]; then
+        echo -e "${RED}   --repo-path is only valid with --skip-repo-download${NC}" >&2
+        exit 1
+    fi
+    REPO_PATH="$INSTALL_PATH/intentioned.tech"
+    echo -e "\n${YELLOW}[5/7] Cloning source (--from-git)...${NC}"
+    # MAINTAINERS ONLY. The source repo is private, so this path fails with an
+    # authentication error for anyone without access — which is intended. It is
+    # not a customer install route; customers use release mode (the default).
+    # INTENTIONED_SOURCE_REPO lets a maintainer point at a fork or SSH remote.
+    SOURCE_REPO="${INTENTIONED_SOURCE_REPO:-git@github.com:intentioned-tech/intentioned.tech.git}"
+    if [ -d "$REPO_PATH" ]; then
+        echo -e "${YELLOW}   Updating existing checkout...${NC}"
+        (cd "$REPO_PATH" && git pull)
+    else
+        echo -e "${YELLOW}   Note: --from-git is for maintainers; the source repo is private.${NC}"
+        git clone "$SOURCE_REPO" "$REPO_PATH"
+    fi
+    echo -e "${GREEN}   Cloned ✓${NC}"
+else
+    # ── Release mode (default) ────────────────────────────────────────────────
+    #
+    # Fetches the compiled build this account is entitled to from the private
+    # R2 bucket, through the licence Worker's authenticated routes. This
+    # replaces a `git clone` of the source repo, which handed every customer the
+    # full proprietary tree and only worked while that repo stayed public.
+    #
+    # The bucket has no public URL. The caller never names an object key either:
+    # the Worker resolves the key from the account's entitlement, so there is no
+    # path to traverse and no way to fetch another customer's build.
+    if [ -n "$REPO_PATH_CLI" ]; then
+        echo -e "${RED}   --repo-path is only valid with --skip-repo-download${NC}" >&2
+        exit 1
+    fi
+    REPO_PATH="$INSTALL_PATH/intentioned.tech"
+    echo -e "\n${YELLOW}[5/7] Downloading your licensed build...${NC}"
+
+    command_exists curl || { echo -e "${RED}   curl is required to download the release.${NC}" >&2; exit 1; }
+    if ! command_exists zstd && ! tar --help 2>/dev/null | grep -q zstd; then
+        echo -e "${RED}   zstd is required to unpack the release (tar.zst).${NC}" >&2
+        echo -e "${YELLOW}   Install it: apt-get install zstd | dnf install zstd | pacman -S zstd${NC}" >&2
+        exit 1
+    fi
+
+    WORKER_URL="${WORKER_URL%/}"
+    # Prompt on /dev/tty, not stdin. This script is meant to be runnable as
+    # `curl ... | bash`, where stdin IS the script — a bare `read` would swallow
+    # the rest of the installer instead of waiting for the operator. If there is
+    # no terminal at all (CI, provisioning), fall through to the error below and
+    # tell them which env vars to set.
+    if [ -t 0 ] || [ -e /dev/tty ]; then
+        [ -n "$REL_USERNAME" ] || read -r -p "   Licence username: " REL_USERNAME < /dev/tty || true
+        if [ -z "$REL_PASSWORD" ]; then
+            read -r -s -p "   Licence password: " REL_PASSWORD < /dev/tty || true
+            echo
+        fi
+    fi
+    if [ -z "$REL_USERNAME" ] || [ -z "$REL_PASSWORD" ]; then
+        echo -e "${RED}   Username and password are required to download a build.${NC}" >&2
+        echo -e "${YELLOW}   Non-interactive: INTENTIONED_USERNAME=... INTENTIONED_PASSWORD=... bash install.sh${NC}" >&2
+        exit 1
+    fi
+
+    DL_WORK="$(mktemp -d)"
+    trap 'rm -rf "$DL_WORK"' EXIT
+    # Credentials go in a mode-600 curl config, never in argv: /proc/*/cmdline is
+    # world-readable, so a password on the command line leaks to every local user.
+    AUTHFILE="$DL_WORK/curl-auth"
+    : > "$AUTHFILE"; chmod 600 "$AUTHFILE"
+    printf 'user = "%s:%s"\n' "$REL_USERNAME" "$REL_PASSWORD" >> "$AUTHFILE"
+
+    echo -e "${YELLOW}   Checking entitlement: $WORKER_URL/api/v1/update/check${NC}"
+    printf '{"current_version":null}' > "$DL_WORK/check-req.json"
+    HTTP="$(curl -sS --retry 3 --max-time 60 -K "$AUTHFILE" \
+        -o "$DL_WORK/check.json" -w '%{http_code}' \
+        -H 'content-type: application/json' \
+        --data-binary "@$DL_WORK/check-req.json" \
+        "$WORKER_URL/api/v1/update/check" || echo 000)"
+    if [ "$HTTP" = "401" ]; then
+        echo -e "${RED}   Authentication failed — check the username and password.${NC}" >&2; exit 1
+    elif [ "$HTTP" != "200" ]; then
+        echo -e "${RED}   Entitlement check failed (HTTP $HTTP).${NC}" >&2
+        [ -s "$DL_WORK/check.json" ] && head -c 400 "$DL_WORK/check.json" >&2 && echo >&2
+        exit 1
+    fi
+
+    # Parse with the interpreter already located in [1/7] rather than adding a
+    # jq dependency for three fields.
+    REL_VERSION="$("$PYTHON_BIN" -c 'import json,sys;print(json.load(open(sys.argv[1])).get("version") or "")' "$DL_WORK/check.json")"
+    REL_SHA256="$("$PYTHON_BIN" -c 'import json,sys;print(json.load(open(sys.argv[1])).get("sha256") or "")' "$DL_WORK/check.json")"
+    if [ -z "$REL_VERSION" ]; then
+        echo -e "${RED}   No release is available for this account.${NC}" >&2
+        "$PYTHON_BIN" -c 'import json,sys;print("   "+(json.load(open(sys.argv[1])).get("message") or ""))' "$DL_WORK/check.json" >&2 || true
+        exit 1
+    fi
+    echo -e "${GREEN}   Entitled to version $REL_VERSION ✓${NC}"
+
+    # ?version= pins the bytes to what the check returned, so a release published
+    # between the two calls cannot swap them under the hash we verify next.
+    # -C - resumes a partial download rather than restarting a multi-GB transfer.
+    echo -e "${YELLOW}   Downloading (resumable)...${NC}"
+    HTTP="$(curl -sS --retry 3 --retry-delay 5 --max-time 3600 -C - -K "$AUTHFILE" \
+        -o "$DL_WORK/release.tar.zst" -w '%{http_code}' --progress-bar \
+        "$WORKER_URL/api/v1/update/download?version=$REL_VERSION" || echo 000)"
+    case "$HTTP" in
+        200|206) ;;
+        409) echo -e "${RED}   A new release was published mid-download; re-run the installer.${NC}" >&2; exit 1 ;;
+        *)   echo -e "${RED}   Download failed (HTTP $HTTP).${NC}" >&2; exit 1 ;;
+    esac
+
+    if [ -n "$REL_SHA256" ]; then
+        echo -e "${YELLOW}   Verifying checksum...${NC}"
+        GOT="$("$PYTHON_BIN" - "$DL_WORK/release.tar.zst" <<'PY'
+import hashlib, sys
+h = hashlib.sha256()
+with open(sys.argv[1], "rb") as fh:
+    for chunk in iter(lambda: fh.read(1 << 20), b""):
+        h.update(chunk)
+print(h.hexdigest())
+PY
+)"
+        if [ "$GOT" != "$REL_SHA256" ]; then
+            echo -e "${RED}   Checksum mismatch — refusing to install.${NC}" >&2
+            echo -e "${RED}     expected $REL_SHA256${NC}" >&2
+            echo -e "${RED}     got      $GOT${NC}" >&2
+            exit 1
+        fi
+        echo -e "${GREEN}   Checksum verified ✓${NC}"
+    else
+        echo -e "${YELLOW}   Release registry published no sha256; skipping verification.${NC}"
+    fi
+
+    # Unpack beside the target and swap, so a failed extraction cannot leave a
+    # half-written install where a working one used to be.
+    STAGE="$DL_WORK/stage"; mkdir -p "$STAGE"
+    tar --zstd -xf "$DL_WORK/release.tar.zst" -C "$STAGE" \
+        || { echo -e "${RED}   Failed to unpack the release archive.${NC}" >&2; exit 1; }
+    # Releases are packed with a single top-level directory; tolerate both shapes.
+    SRC_ROOT="$STAGE"
+    if [ "$(find "$STAGE" -maxdepth 1 -mindepth 1 | wc -l)" -eq 1 ]; then
+        _only="$(find "$STAGE" -maxdepth 1 -mindepth 1)"
+        [ -d "$_only" ] && SRC_ROOT="$_only"
+    fi
+
+    mkdir -p "$(dirname "$REPO_PATH")"
+    if [ -d "$REPO_PATH" ]; then
+        # merge-dist.sh owns in-place upgrades precisely because it preserves
+        # config.json, credentials and TLS material. Do not re-implement that
+        # here; hand over to it when it is present.
+        if [ -x "$REPO_PATH/merge-dist.sh" ]; then
+            echo -e "${YELLOW}   Existing install found — merging via merge-dist.sh (preserves settings)...${NC}"
+            "$REPO_PATH/merge-dist.sh" "$SRC_ROOT" "$REPO_PATH" \
+                || { echo -e "${RED}   merge-dist.sh failed.${NC}" >&2; exit 1; }
+        else
+            echo -e "${YELLOW}   Existing install found — backing it up to $REPO_PATH.bak${NC}"
+            rm -rf "$REPO_PATH.bak"; mv "$REPO_PATH" "$REPO_PATH.bak"
+            mv "$SRC_ROOT" "$REPO_PATH"
+        fi
+    else
+        mv "$SRC_ROOT" "$REPO_PATH"
+    fi
+
+    rm -rf "$DL_WORK"; trap - EXIT
+    echo -e "${GREEN}   Installed build $REL_VERSION to $REPO_PATH ✓${NC}"
+fi
+
+# Create virtual environment and install dependencies
+echo -e "\n${YELLOW}[6/7] Installing Python dependencies...${NC}"
+cd "$REPO_PATH"
+# Test the interpreter, not the directory. `[ ! -d myenv ]` alone treats a venv
+# whose interpreter has vanished as usable, and every later ./myenv/bin/pip call
+# then fails with a bare "No such file or directory". That is not hypothetical:
+# a distro upgrade that retires the old minor version deletes the very binary
+# these symlinks point at, leaving a full 9 GB tree with a dangling bin/python.
+if ! ./myenv/bin/python -c 'import sys; sys.exit(0 if sys.version_info[:2]==(3,12) else 1)' 2>/dev/null; then
+    if [ -d "myenv" ]; then
+        echo -e "${YELLOW}   Existing myenv is unusable (missing or non-3.12 interpreter); rebuilding.${NC}"
+        echo -e "${YELLOW}   The previous tree is kept at myenv.broken until this install succeeds.${NC}"
+        rm -rf myenv.broken
+        mv myenv myenv.broken
+    fi
+    "$PYTHON_BIN" -m venv myenv || {
+        echo -e "${RED}   Could not create the virtualenv with $PYTHON_BIN.${NC}"
+        echo -e "${RED}   On Debian/Ubuntu this usually means python3.12-venv is missing.${NC}"
+        exit 1
+    }
+fi
+# ROCm wheels use manylinux_2_28; pip < 24 often reports "No matching distribution"
+# for torchvision/torchaudio even when wheels exist. Keep setuptools/wheel current too.
+./myenv/bin/pip install --upgrade 'pip>=24.2' setuptools wheel
+
+SELECTED_BACKEND="$(detect_backend)"
+echo -e "${YELLOW}   Selected PyTorch backend: ${SELECTED_BACKEND}${NC}"
+
+case "$SELECTED_BACKEND" in
+    cuda)
+        echo -e "${YELLOW}   Installing PyTorch with CUDA 13.0 support...${NC}"
+        # PyTorch 2.11.0 requires setuptools<82, nv-one-logger requires setuptools>=79
+        ./myenv/bin/pip install 'setuptools>=79,<82' >/dev/null 2>&1 || true
+        ./myenv/bin/pip install --no-cache-dir \
+            torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 \
+            --index-url https://download.pytorch.org/whl/cu130
+        echo -e "${YELLOW}   Installing NVIDIA-only acceleration packages...${NC}"
+        ./myenv/bin/pip install 'cuda-python>=12.9.0' 'bitsandbytes>=0.49.1' || \
+            echo -e "${YELLOW}   Optional CUDA acceleration packages failed; continuing.${NC}"
+        ;;
+    rocm)
+        echo -e "${YELLOW}   Installing PyTorch with AMD ROCm 7.2.1 support...${NC}"
+        ./myenv/bin/pip uninstall -y torch torchvision torchaudio pytorch-triton-rocm >/dev/null 2>&1 || true
+        # Pin a matched trio from the ROCm index so pip always resolves consistent wheels
+        # (open requirements can yield "No matching distribution" for torchvision on some setups).
+        ./myenv/bin/pip install --no-cache-dir \
+            torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 \
+            --index-url https://download.pytorch.org/whl/rocm7.2
+        echo -e "${YELLOW}   Removing CUDA-only packages if present...${NC}"
+        ./myenv/bin/pip uninstall -y bitsandbytes cuda-python >/dev/null 2>&1 || true
+        ;;
+    cpu)
+        echo -e "${YELLOW}   Installing PyTorch CPU/macOS wheels...${NC}"
+        ./myenv/bin/pip install torch torchvision torchaudio
+        ;;
+esac
+
+./myenv/bin/pip install -r requirements.txt
+
+# Drop the GPL-3.0 G2P extras that arrive transitively.
+#
+# Dropping `misaki[en]` from requirements.txt is NOT enough: `kokoro` itself
+# declares `Requires-Dist: misaki[en]>=0.9.4`, and that extra requires
+# phonemizer-fork and espeakng-loader — the latter bundling a GPL-3.0
+# libespeak-ng.so. So they come back on every clean install no matter how
+# requirements.txt lists misaki. pip has no "install this but not that extra",
+# hence removing them afterwards.
+#
+# Kokoro keeps working: server.py::_ensure_kokoro_importable() seeds a GPL-free
+# stub for `misaki.espeak`, and Kokoro's own try/except then falls back to its
+# documented degraded mode. The only cost is that out-of-dictionary English
+# words are skipped rather than guessed at.
+#
+# Operators who are NOT redistributing and want full G2P coverage can opt back
+# in — it is a licensing decision, not a dependency one:
+#     ./myenv/bin/pip install phonemizer-fork espeakng_loader
+./myenv/bin/pip uninstall -y -q phonemizer-fork espeakng-loader >/dev/null 2>&1 || true
+
+# requirements.txt can pull optional deps; keep AMD stacks free of NVIDIA-only wheels.
+if [ "$SELECTED_BACKEND" = "rocm" ]; then
+    echo -e "${YELLOW}   Removing CUDA-only Python packages (NeMo/ROCm hosts have no libcuda.so.1)...${NC}"
+    ./myenv/bin/pip uninstall -y bitsandbytes cuda-python >/dev/null 2>&1 || true
+fi
+
+if [ "$INSTALL_LLAMA_CPP" = true ]; then
+    echo -e "${YELLOW}   Building llama-cpp-python for ${SELECTED_BACKEND} (GGUF support)...${NC}"
+    case "$SELECTED_BACKEND" in
+        cuda)
+            # CUDA's host_config.h caps the supported host GCC (e.g. CUDA 13.x
+            # rejects GCC 16). On rolling-release distros (Arch/CachyOS) the
+            # system gcc can exceed that cap, failing the build with
+            # "unsupported GNU version". Detect a compatible older gcc-N/g++-N
+            # and pin it as the CUDA host compiler (and C/C++ compiler, so the
+            # host and device object files share one libstdc++ ABI).
+            CUDA_HOST_ARGS=""
+            _maxg=15
+            _hc="$(dirname "$(dirname "$(readlink -f "$(command -v nvcc 2>/dev/null)" 2>/dev/null)")" 2>/dev/null)/targets/x86_64-linux/include/crt/host_config.h"
+            if [ -f "$_hc" ]; then
+                _g="$(grep -oE '__GNUC__ > [0-9]+' "$_hc" | grep -oE '[0-9]+' | head -1)"
+                [ -n "$_g" ] && _maxg="$_g"
+            fi
+            _curg="$(gcc -dumpversion 2>/dev/null | cut -d. -f1)"
+            if [ -n "$_curg" ] && [ "$_curg" -gt "$_maxg" ]; then
+                for _v in $(seq "$_maxg" -1 9); do
+                    if command -v "gcc-$_v" >/dev/null 2>&1 && command -v "g++-$_v" >/dev/null 2>&1; then
+                        CUDA_HOST_ARGS="-DCMAKE_C_COMPILER=$(command -v "gcc-$_v") -DCMAKE_CXX_COMPILER=$(command -v "g++-$_v") -DCMAKE_CUDA_HOST_COMPILER=$(command -v "g++-$_v")"
+                        echo -e "${YELLOW}   System gcc $_curg > CUDA max $_maxg; pinning gcc-$_v as CUDA host compiler.${NC}"
+                        break
+                    fi
+                done
+                [ -z "$CUDA_HOST_ARGS" ] && echo -e "${YELLOW}   System gcc $_curg > CUDA max $_maxg and no older gcc-N found; CUDA build may fail. Install gcc-$_maxg (e.g. 'gcc15' on Arch).${NC}"
+            fi
+            CMAKE_ARGS="-DGGML_CUDA=on ${CUDA_HOST_ARGS}" \
+                ./myenv/bin/pip install --upgrade --no-cache-dir 'llama-cpp-python>=0.3.0' || \
+                echo -e "${YELLOW}   llama-cpp-python CUDA build failed; GGUF disabled.${NC}"
+            ;;
+        rocm)
+            # Prebuilt manylinux wheels may link libcuda.so.1; AMD boxes have no NVIDIA
+            # driver, so import fails and server.py reports GGUF "not installed". Force a
+            # local build: disable GGML_CUDA, prefer HIPBLAS, fall back to CPU-only.
+            echo -e "${YELLOW}   Removing any pip wheel llama-cpp-python (rebuild from source)...${NC}"
+            ./myenv/bin/pip uninstall -y llama-cpp-python >/dev/null 2>&1 || true
+            ROCM_LLAMA_BASE="-DGGML_CUDA=OFF"
+            ROCM_GFX="$(rocminfo 2>/dev/null | grep -oE 'gfx[0-9a-f]+' | head -1 || true)"
+            _rocm_llama_cpu_fallback() {
+                echo -e "${YELLOW}   HIP llama-cpp-python failed; trying CPU-only (GGUF still works)...${NC}"
+                FORCE_CMAKE=1 CMAKE_ARGS="${ROCM_LLAMA_BASE} -DGGML_HIPBLAS=OFF" \
+                    ./myenv/bin/pip install --upgrade --no-cache-dir --no-binary llama-cpp-python \
+                    'llama-cpp-python>=0.3.0' || \
+                    echo -e "${YELLOW}   llama-cpp-python CPU build failed; GGUF disabled.${NC}"
+            }
+            if [ -n "$ROCM_GFX" ]; then
+                FORCE_CMAKE=1 CMAKE_ARGS="${ROCM_LLAMA_BASE} -DGGML_HIPBLAS=on -DAMDGPU_TARGETS=${ROCM_GFX} -DCMAKE_C_COMPILER=hipcc -DCMAKE_CXX_COMPILER=hipcc" \
+                    ./myenv/bin/pip install --upgrade --no-cache-dir --no-binary llama-cpp-python \
+                    'llama-cpp-python>=0.3.0' || \
+                    {
+                        echo -e "${YELLOW}   ROCm HIP build with target ${ROCM_GFX} failed; retrying without AMDGPU_TARGETS...${NC}"
+                        FORCE_CMAKE=1 CMAKE_ARGS="${ROCM_LLAMA_BASE} -DGGML_HIPBLAS=on -DCMAKE_C_COMPILER=hipcc -DCMAKE_CXX_COMPILER=hipcc" \
+                            ./myenv/bin/pip install --upgrade --no-cache-dir --no-binary llama-cpp-python \
+                            'llama-cpp-python>=0.3.0' || _rocm_llama_cpu_fallback
+                    }
+            else
+                FORCE_CMAKE=1 CMAKE_ARGS="${ROCM_LLAMA_BASE} -DGGML_HIPBLAS=on -DCMAKE_C_COMPILER=hipcc -DCMAKE_CXX_COMPILER=hipcc" \
+                    ./myenv/bin/pip install --upgrade --no-cache-dir --no-binary llama-cpp-python \
+                    'llama-cpp-python>=0.3.0' || _rocm_llama_cpu_fallback
+            fi
+            ;;
+        cpu)
+            CMAKE_ARGS="-DGGML_CUDA=OFF" \
+                ./myenv/bin/pip install --upgrade --no-cache-dir 'llama-cpp-python>=0.3.0' || \
+                echo -e "${YELLOW}   llama-cpp-python CPU build failed; GGUF disabled.${NC}"
+            ;;
+    esac
+else
+    echo -e "${YELLOW}   Skipping llama-cpp-python (--no-llama-cpp). GGUF models will not load.${NC}"
+fi
+
+if [ -n "$GGUF_MODEL" ]; then
+    echo -e "${YELLOW}   Configuring GGUF LLM: ${GGUF_MODEL}${NC}"
+    GGUF_MODEL="$GGUF_MODEL" ./myenv/bin/python - <<'PY'
+import json
+import os
+from pathlib import Path
+
+raw = os.environ.get("GGUF_MODEL", "").strip()
+if not raw:
+    raise SystemExit(0)
+
+path = Path("config.json")
+if path.exists():
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        config = {}
+else:
+    try:
+        from config_tool import DEFAULT_CONFIG
+        config = json.loads(json.dumps(DEFAULT_CONFIG))
+    except Exception:
+        config = {}
+
+models = config.setdefault("models", {})
+
+if raw.lower().endswith(".gguf") and os.path.sep in raw and not raw.startswith(("http://", "https://")):
+    # Local filesystem path.
+    models["llm_model_id"] = raw
+    models["llm_gguf_filename"] = ""
+elif ":" in raw and not raw.lower().endswith(".gguf"):
+    repo, _, filename = raw.partition(":")
+    models["llm_model_id"] = repo
+    models["llm_gguf_filename"] = filename
+else:
+    models["llm_model_id"] = raw
+    models["llm_gguf_filename"] = models.get("llm_gguf_filename", "")
+
+models["llm_runtime"] = "llama_cpp"
+print(f"   GGUF model -> {models['llm_model_id']}  filename={models['llm_gguf_filename']!r}")
+
+path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+PY
+fi
+
+if [ "$SELECTED_BACKEND" = "rocm" ]; then
+    echo -e "${YELLOW}   Configuring ROCm defaults (16bit quantization)...${NC}"
+    ./myenv/bin/python - <<'PY'
+import json
+from pathlib import Path
+
+path = Path("config.json")
+if path.exists():
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        config = {}
+else:
+    try:
+        from config_tool import DEFAULT_CONFIG
+        config = json.loads(json.dumps(DEFAULT_CONFIG))
+    except Exception:
+        config = {}
+
+advanced = config.setdefault("advanced", {})
+hardware = config.setdefault("hardware", {})
+models = config.setdefault("models", {})
+summarization = config.setdefault("summarization", {})
+
+advanced["compute_backend"] = "rocm"
+hardware["use_gpu"] = True
+hardware["use_cpu"] = False
+models["quantization_type"] = "16bit"
+models["analysis_quantization_type"] = "16bit"
+
+ROCM_FRIENDLY_LLM = "Qwen/Qwen2.5-3B-Instruct"
+ROCM_FRIENDLY_SUMMARIZER = "Qwen/Qwen2.5-1.5B-Instruct"
+
+OVERSIZED_FOR_16GB = (
+    "google/gemma-4-e4b-it",
+    "google/gemma-4-E4B-it",
+    "meta-llama/Llama-3.2-7B-Instruct",
+    "Qwen/Qwen2.5-7B-Instruct",
+    "mistralai/Mistral-7B-Instruct-v0.3",
+)
+
+current_llm = (models.get("llm_model_id") or "").strip()
+if not current_llm or current_llm in OVERSIZED_FOR_16GB:
+    print(f"   ROCm: pinning llm_model_id -> {ROCM_FRIENDLY_LLM}")
+    models["llm_model_id"] = ROCM_FRIENDLY_LLM
+
+current_analysis = (models.get("analysis_model_id") or "").strip()
+if not current_analysis or current_analysis in OVERSIZED_FOR_16GB:
+    print(f"   ROCm: pinning analysis_model_id -> {ROCM_FRIENDLY_LLM}")
+    models["analysis_model_id"] = ROCM_FRIENDLY_LLM
+
+current_summ = (summarization.get("model_id") or "").strip()
+if not current_summ or current_summ in OVERSIZED_FOR_16GB:
+    print(f"   ROCm: pinning summarization.model_id -> {ROCM_FRIENDLY_SUMMARIZER}")
+    summarization["model_id"] = ROCM_FRIENDLY_SUMMARIZER
+
+summarization["quantization_type"] = "16bit"
+
+path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+PY
+fi
+echo -e "${GREEN}   Dependencies installed ✓${NC}"
+
+# Setup passwordless sudo for service restart
+echo -e "\n${YELLOW}[7/8] Setting up passwordless sudo for service restart...${NC}"
+CURRENT_USER=$(whoami)
+SUDOERS_FILE="/etc/sudoers.d/intentioned-restart"
+
+if [ "$PLATFORM" = "Linux" ]; then
+    echo -e "${YELLOW}   Creating sudoers rule for ${CURRENT_USER}...${NC}"
+    
+    # Create temporary sudoers file
+    TEMP_SUDOERS=$(mktemp)
+    echo "${CURRENT_USER} ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart intentioned-server.service" > "$TEMP_SUDOERS"
+    
+    # Validate syntax before installing
+    if sudo visudo -cf "$TEMP_SUDOERS" > /dev/null 2>&1; then
+        sudo install -o root -g root -m 0440 "$TEMP_SUDOERS" "$SUDOERS_FILE"
+        echo -e "${GREEN}   Sudoers rule installed ✓${NC}"
+        
+        # Test the configuration
+        if sudo -n systemctl status intentioned-server.service > /dev/null 2>&1; then
+            echo -e "${GREEN}   Passwordless sudo verified ✓${NC}"
+        else
+            echo -e "${YELLOW}   Sudoers rule installed but service not yet running${NC}"
+        fi
+    else
+        echo -e "${RED}   Sudoers syntax validation failed${NC}"
+        echo -e "${YELLOW}   You may need to manually configure sudoers${NC}"
+    fi
+    
+    rm -f "$TEMP_SUDOERS"
+else
+    echo -e "${YELLOW}   Skipping sudoers setup (not supported on ${PLATFORM})${NC}"
+fi
+
+# Apply NeMo CUDA graph patches (fixes cu_call unpacking bug)
+echo -e "${YELLOW}   Applying NeMo patches...${NC}"
+./myenv/bin/python apply_nemo_patch.py || echo -e "${YELLOW}   NeMo patch skipped (will retry at startup)${NC}"
+echo -e "${GREEN}   NeMo patches applied ✓${NC}"
+
+# Create start scripts
+echo -e "\n${YELLOW}[8/8] Creating launch scripts...${NC}"
+
+# Create start script
+cat > "$INSTALL_PATH/start-intentioned.sh" << EOF
+#!/bin/bash
+cd "$REPO_PATH"
+source myenv/bin/activate
+python server.py
+EOF
+chmod +x "$INSTALL_PATH/start-intentioned.sh"
+
+# Create config script
+cat > "$INSTALL_PATH/config-intentioned.sh" << EOF
+#!/bin/bash
+cd "$REPO_PATH"
+source myenv/bin/activate
+python config_tool.py
+EOF
+chmod +x "$INSTALL_PATH/config-intentioned.sh"
+
+# Create symlinks in user's bin directory
+USER_BIN="$HOME/.local/bin"
+mkdir -p "$USER_BIN"
+ln -sf "$INSTALL_PATH/start-intentioned.sh" "$USER_BIN/intentioned"
+ln -sf "$INSTALL_PATH/config-intentioned.sh" "$USER_BIN/intentioned-config"
+
+# Add to PATH if needed
+if [[ ":$PATH:" != *":$USER_BIN:"* ]]; then
+    echo "export PATH=\"\$PATH:$USER_BIN\"" >> "$HOME/.bashrc"
+    echo "export PATH=\"\$PATH:$USER_BIN\"" >> "$HOME/.zshrc" 2>/dev/null || true
+    echo -e "${YELLOW}   Added $USER_BIN to PATH (restart shell to apply)${NC}"
+fi
+
+# Create desktop entry for Linux
+if [ "$PLATFORM" = "Linux" ]; then
+    DESKTOP_DIR="$HOME/.local/share/applications"
+    mkdir -p "$DESKTOP_DIR"
+    
+    cat > "$DESKTOP_DIR/intentioned.desktop" << EOF
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Intentioned.tech
+Comment=Social Skills Training Platform
+Exec=$INSTALL_PATH/start-intentioned.sh
+Icon=$REPO_PATH/favicon.ico
+Terminal=true
+Categories=Education;
+EOF
+
+    cat > "$DESKTOP_DIR/intentioned-config.desktop" << EOF
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Intentioned.tech Config
+Comment=Intentioned.tech Configuration Tool
+Exec=$INSTALL_PATH/config-intentioned.sh
+Icon=$REPO_PATH/favicon.ico
+Terminal=false
+Categories=Education;Settings;
+EOF
+
+    echo -e "${GREEN}   Desktop entries created ✓${NC}"
+fi
+
+echo -e "${GREEN}"
+echo "╔═══════════════════════════════════════════════════════════════╗"
+echo "║                  Installation Complete! 🎉                     ║"
+echo "╠═══════════════════════════════════════════════════════════════╣"
+echo "║  To start Intentioned.tech:                                        ║"
+echo "║    intentioned                                                 ║"
+echo "║    or: $INSTALL_PATH/start-intentioned.sh                      "
+echo "║                                                                ║"
+echo "║  To configure:                                                 ║"
+echo "║    intentioned-config                                          ║"
+echo "║    or: $INSTALL_PATH/config-intentioned.sh                     "
+echo "║                                                                ║"
+echo "║  Installation path: $INSTALL_PATH                              "
+echo "╚═══════════════════════════════════════════════════════════════╝"
+echo -e "${NC}"
+
+# Offer to open config tool
+if [ "$OPEN_CONFIG" = true ]; then
+    echo -e "\n${CYAN}Would you like to configure Intentioned.tech now? (Y/n)${NC}"
+    read -r response
+    if [[ ! "$response" =~ ^[Nn]$ ]]; then
+        echo -e "${CYAN}Opening Configuration Tool...${NC}"
+        cd "$REPO_PATH"
+        source myenv/bin/activate
+        python config_tool.py
+    fi
+fi
+
+echo -e "\n${CYAN}Thank you for installing Intentioned.tech!${NC}"
