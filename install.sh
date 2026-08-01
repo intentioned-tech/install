@@ -427,9 +427,22 @@ PY
         # merge-dist.sh owns in-place upgrades precisely because it preserves
         # config.json, credentials and TLS material. Do not re-implement that
         # here; hand over to it when it is present.
-        if [ -x "$REPO_PATH/merge-dist.sh" ]; then
+        #
+        # It takes NO positional arguments: the source is --from and the
+        # destination is only ever $INTENTIONED_DIST (its built-in default is a
+        # ../intentioned.tech_cython_dist sibling of its own location, which is
+        # wrong for every installed layout). Passing paths positionally makes it
+        # exit 1 on "Unknown option" before it copies anything. Keep this call
+        # byte-compatible with updater.sh's — they drive the same script.
+        #
+        # Tested with -f, not -x: package-cython.sh chmods it best-effort
+        # (`2>/dev/null || true`), so a release unpacked under a restrictive
+        # umask can ship it non-executable — and falling through to the else
+        # branch would then move the live install out from under a running
+        # server rather than merging into it.
+        if [ -f "$REPO_PATH/merge-dist.sh" ]; then
             echo -e "${YELLOW}   Existing install found — merging via merge-dist.sh (preserves settings)...${NC}"
-            "$REPO_PATH/merge-dist.sh" "$SRC_ROOT" "$REPO_PATH" \
+            INTENTIONED_DIST="$REPO_PATH" bash "$REPO_PATH/merge-dist.sh" --from "$SRC_ROOT" \
                 || { echo -e "${RED}   merge-dist.sh failed.${NC}" >&2; exit 1; }
         else
             echo -e "${YELLOW}   Existing install found — backing it up to $REPO_PATH.bak${NC}"
@@ -439,6 +452,13 @@ PY
     else
         mv "$SRC_ROOT" "$REPO_PATH"
     fi
+
+    # Stamp the version marker updater.sh reads. Without it the updater falls
+    # back to config.json's version field — but config.json is preserved across
+    # merges by design (it holds operator secrets), so that field never advances
+    # and the nightly updater would re-download and re-merge the release we just
+    # installed, every night, until the next one ships.
+    echo "$REL_VERSION" > "$REPO_PATH/.installed_version" 2>/dev/null || true
 
     rm -rf "$DL_WORK"; trap - EXIT
     echo -e "${GREEN}   Installed build $REL_VERSION to $REPO_PATH ✓${NC}"
