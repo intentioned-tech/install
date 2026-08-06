@@ -10,7 +10,8 @@ credentials.
 ## Requirements
 
 - Linux or macOS
-- Python 3.12 (the installer can set this up for you)
+- **Python 3.12** — exactly 3.12, and you install it yourself (see below)
+- **curl** — used to fetch the installer and to download your licensed build
 - A C/C++ compiler, for the `llama-cpp-python` (GGUF) build — the installer
   offers to install one (`build-essential` / `base-devel` / Xcode CLI tools).
   Skip the build with `--no-llama-cpp` if you do not need GGUF models.
@@ -18,6 +19,76 @@ credentials.
 - NVIDIA CUDA, AMD ROCm, or CPU — the backend is auto-detected. GPU offload for
   GGUF also needs the CUDA toolkit (`nvcc`), not just the driver; without it the
   installer builds llama-cpp-python CPU-only.
+
+The compiler, Tk, ffmpeg and the rest are installed for you — by `install.sh`
+itself, or by `install-deps.sh`. Python 3.12 and curl are the two you need in
+place before you start.
+
+### Installing curl
+
+```bash
+sudo apt install -y curl          # Debian, Ubuntu
+sudo dnf install -y curl          # Fedora, RHEL
+sudo pacman -S --needed curl      # Arch, CachyOS
+sudo zypper install -y curl       # openSUSE
+```
+
+macOS ships curl already. If you have `wget` but not `curl`, use it to fetch
+the installer — but install `curl` anyway, since the installer needs it to
+download your build.
+
+### Installing Python 3.12
+
+It must be **3.12 specifically** — not 3.11, not 3.13 or newer. Kokoro TTS and
+NeMo/Parakeet both require it, and the shipped build contains
+`cpython-312-*.so` modules that will not load under any other minor version.
+The installer checks this and stops if 3.12 is missing; it does not install
+Python for you.
+
+```bash
+# Ubuntu 24.04 and newer — in the repositories
+sudo apt install -y python3.12 python3.12-venv python3.12-tk
+
+# Ubuntu 22.04 and older — via the deadsnakes PPA
+sudo add-apt-repository -y ppa:deadsnakes/ppa
+sudo apt update
+sudo apt install -y python3.12 python3.12-venv python3.12-tk
+
+# Fedora / RHEL
+sudo dnf install -y python3.12 python3.12-devel python3.12-tkinter
+
+# openSUSE
+sudo zypper install -y python312 python312-devel python312-tk
+
+# macOS
+brew install python@3.12 python-tk@3.12
+```
+
+`python3.12-venv` is not optional on Debian and Ubuntu: without it the
+installer cannot create `myenv`. `python3.12-tk` is what the configuration tool
+needs — `install-deps.sh` will add it later if you skip it here.
+
+**Arch, CachyOS and Debian 12** do not carry 3.12 (Arch tracks the newest
+Python; Debian 12 ships 3.11, and deadsnakes is Ubuntu-only). Use the AUR
+package `python312` (`yay -S python312`), or [pyenv][pyenv], which works on any
+distribution:
+
+```bash
+pyenv install 3.12
+```
+
+[pyenv]: https://github.com/pyenv/pyenv#installation
+
+The installer finds a pyenv 3.12 automatically. To point it at an interpreter
+somewhere else:
+
+```bash
+INTENTIONED_PYTHON=/path/to/python3.12 bash install.sh
+```
+
+Check what you have with `python3.12 --version`. A bare `python3` is not
+enough — on rolling-release distributions it tracks the newest interpreter,
+which will not work.
 
 ## Install
 
