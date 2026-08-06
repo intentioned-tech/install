@@ -35,10 +35,12 @@ WITH_CUDA=false
 WITH_TK=true
 DRY_RUN=false
 ASSUME_YES=false
+CUDA_VERSION=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
         --cuda)     WITH_CUDA=true; shift ;;
+        --cuda-version) WITH_CUDA=true; CUDA_VERSION="$2"; shift 2 ;;
         --no-tk)    WITH_TK=false; shift ;;
         --dry-run)  DRY_RUN=true; shift ;;
         -y|--yes)   ASSUME_YES=true; shift ;;
@@ -52,8 +54,13 @@ while [[ $# -gt 0 ]]; do
             echo "git, curl and zstd."
             echo ""
             echo "Options:"
-            echo "  --cuda      Also install the distro CUDA toolkit (nvcc), needed to build"
+            echo "  --cuda      Also install the CUDA toolkit (nvcc), needed to build"
             echo "              llama-cpp-python with GPU offload. Large download."
+            echo "              Uses NVIDIA's repository, not the distro package, which is"
+            echo "              frozen at the version current when the release was cut."
+            echo "              Picks the newest version the installed driver supports."
+            echo "  --cuda-version X.Y"
+            echo "              Install this CUDA version instead of the newest, e.g. 13.0."
             echo "  --no-tk     Skip the Tk packages"
             echo "  --dry-run   Print the package-manager commands without running them"
             echo "  -y, --yes   Do not prompt before installing"
@@ -277,15 +284,121 @@ if [ "$WITH_TK" = true ]; then
     done
 fi
 
+# ---------------------------------------------------------------------------
+# CUDA toolkit
+#
+# Distro CUDA packages are frozen at whatever was current when the release was
+# cut — Ubuntu 24.04's `nvidia-cuda-toolkit` is still CUDA 12 — so --cuda goes
+# to NVIDIA's own repository, which carries every current version.
+#
+# Newest is not automatically right, though. nvcc produces binaries that need a
+# driver from the same CUDA major family: build llama-cpp-python with 13.x
+# against a driver that only supports 12.x and it compiles fine, then fails at
+# runtime. So the version is capped by what the installed driver reports.
+# ---------------------------------------------------------------------------
+
+# Highest CUDA version the installed driver supports, per nvidia-smi's header.
+cuda_driver_max() {
+    command_exists nvidia-smi || return 1
+    nvidia-smi 2>/dev/null |
+        sed -n 's/.*CUDA Version:[[:space:]]*\([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -1
+}
+
+# $1 <= $2, compared as version numbers.
+ver_le() {
+    [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" = "$1" ]
+}
+
+# NVIDIA publishes one repository per distro release, named like "ubuntu2404".
+nvidia_repo_id() {
+    [ -r /etc/os-release ] || return 1
+    . /etc/os-release
+    case "$ID" in
+        ubuntu)                      echo "ubuntu${VERSION_ID//./}" ;;
+        debian)                      echo "debian${VERSION_ID%%.*}" ;;
+        fedora)                      echo "fedora${VERSION_ID%%.*}" ;;
+        rhel|centos|rocky|almalinux) echo "rhel${VERSION_ID%%.*}" ;;
+        opensuse*|sles)              echo "opensuse15" ;;
+        *) return 1 ;;
+    esac
+}
+
+nvidia_repo_arch() {
+    case "$(uname -m)" in
+        x86_64)       echo "x86_64" ;;
+        aarch64|arm64) echo "sbsa" ;;
+        *) return 1 ;;
+    esac
+}
+
+add_nvidia_repo() {
+    local rid arch base tmp
+    rid="$(nvidia_repo_id)" || return 1
+    arch="$(nvidia_repo_arch)" || return 1
+    base="https://developer.download.nvidia.com/compute/cuda/repos/$rid/$arch"
+    case "$PKG" in
+        apt)
+            tmp="$(mktemp -d)"
+            curl -fsSL -o "$tmp/cuda-keyring.deb" "$base/cuda-keyring_1.1-1_all.deb" || {
+                rm -rf "$tmp"; return 1
+            }
+            _as_root dpkg -i "$tmp/cuda-keyring.deb" >/dev/null 2>&1 || { rm -rf "$tmp"; return 1; }
+            rm -rf "$tmp"
+            _as_root apt-get update -qq || true
+            ;;
+        dnf)
+            # dnf5 renamed the subcommand; try both spellings.
+            _as_root dnf config-manager --add-repo "$base/cuda-$rid.repo" >/dev/null 2>&1 ||
+                _as_root dnf config-manager addrepo --from-repofile="$base/cuda-$rid.repo" >/dev/null 2>&1 ||
+                return 1
+            ;;
+        zypper)
+            _as_root zypper --non-interactive addrepo "$base/cuda-$rid.repo" >/dev/null 2>&1 || return 1
+            _as_root zypper --non-interactive refresh >/dev/null 2>&1 || true
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# Versioned toolkit packages the repositories carry, as "cuda-toolkit-13-3".
+cuda_toolkit_packages() {
+    case "$PKG" in
+        apt)    apt-cache search --names-only '^cuda-toolkit-[0-9]+-[0-9]+$' 2>/dev/null | awk '{print $1}' ;;
+        dnf)    dnf repoquery --qf '%{name}\n' 'cuda-toolkit-*' 2>/dev/null |
+                    grep -E '^cuda-toolkit-[0-9]+-[0-9]+$' | sort -u ;;
+        zypper) zypper --non-interactive search --type package 'cuda-toolkit-*' 2>/dev/null |
+                    awk -F'|' '{gsub(/ /,"",$2); print $2}' | grep -E '^cuda-toolkit-[0-9]+-[0-9]+$' | sort -u ;;
+    esac
+}
+
+# Newest toolkit package the driver can actually run, or "" to fall back.
+pick_cuda_toolkit() {
+    local cap="$1" best="" best_v="" pkg v
+    for pkg in $(cuda_toolkit_packages); do
+        v="${pkg#cuda-toolkit-}"
+        v="${v//-/.}"
+        if [ -n "$cap" ] && ! ver_le "$v" "$cap"; then
+            continue
+        fi
+        if [ -z "$best_v" ] || ver_le "$best_v" "$v"; then
+            best_v="$v"
+            best="$pkg"
+        fi
+    done
+    echo "$best"
+}
+
 CUDA_PKGS=""
+CUDA_PLAN=""
 if [ "$WITH_CUDA" = true ]; then
     case "$PKG" in
-        apt)    CUDA_PKGS="nvidia-cuda-toolkit" ;;
-        dnf)    CUDA_PKGS="cuda-toolkit" ;;
-        pacman) CUDA_PKGS="cuda" ;;
-        zypper) CUDA_PKGS="cuda-toolkit" ;;
-        brew)   CUDA_PKGS="" ;;   # no CUDA on macOS
+        pacman) CUDA_PKGS="cuda"; CUDA_PLAN="cuda" ;;   # Arch tracks the current release
+        brew)   ;;                                       # no CUDA on macOS
+        *)      CUDA_PLAN="newest from NVIDIA's repository" ;;
     esac
+    if [ -n "$CUDA_VERSION" ]; then
+        CUDA_PLAN="$CUDA_VERSION (requested)"
+    fi
 fi
 
 echo ""
@@ -294,7 +407,7 @@ echo -e "${YELLOW}Build toolchain:${NC}$BUILD_PKGS"
 echo -e "${YELLOW}Runtime tools:${NC}  $TOOL_PKGS"
 [ -n "$TK_PKGS" ]   && echo -e "${YELLOW}Tk (tkinter):${NC}  $TK_PKGS"
 [ -n "$DEV_PKGS" ]  && echo -e "${YELLOW}Python headers:${NC}$DEV_PKGS"
-[ -n "$CUDA_PKGS" ] && echo -e "${YELLOW}CUDA toolkit:${NC}  $CUDA_PKGS"
+[ -n "$CUDA_PLAN" ] && echo -e "${YELLOW}CUDA toolkit:${NC}  $CUDA_PLAN"
 echo ""
 
 if [ "$ASSUME_YES" != true ] && [ "$DRY_RUN" != true ]; then
@@ -343,9 +456,43 @@ if [ -n "$TK_PKGS" ]; then
     # shellcheck disable=SC2086
     install_group "Tk (tkinter)" $TK_PKGS
 fi
-if [ -n "$CUDA_PKGS" ]; then
-    # shellcheck disable=SC2086
-    install_group "CUDA toolkit" $CUDA_PKGS
+if [ "$WITH_CUDA" = true ] && [ "$PKG" != "brew" ]; then
+    if [ -n "$CUDA_PKGS" ]; then
+        # Arch: the distro package already tracks the current release.
+        # shellcheck disable=SC2086
+        install_group "CUDA toolkit" $CUDA_PKGS
+    else
+        echo -e "\n${YELLOW}Installing CUDA toolkit...${NC}"
+        if [ "$DRY_RUN" != true ] && ! add_nvidia_repo; then
+            echo -e "${YELLOW}   Could not add NVIDIA's repository for this distribution.${NC}"
+        fi
+
+        # An explicit --cuda-version wins; otherwise cap at what the driver runs.
+        CUDA_CAP="$CUDA_VERSION"
+        if [ -z "$CUDA_CAP" ]; then
+            CUDA_CAP="$(cuda_driver_max || true)"
+            if [ -n "$CUDA_CAP" ]; then
+                echo -e "${YELLOW}   Driver supports up to CUDA $CUDA_CAP; not going past it.${NC}"
+            else
+                echo -e "${YELLOW}   No driver detected; installing the newest toolkit.${NC}"
+            fi
+        fi
+
+        CUDA_PKG="$(pick_cuda_toolkit "$CUDA_CAP")"
+        if [ -z "$CUDA_PKG" ] && [ -n "$CUDA_CAP" ]; then
+            echo -e "${YELLOW}   No toolkit at or below CUDA $CUDA_CAP is available.${NC}"
+            echo -e "${YELLOW}   Update the driver, or pass --cuda-version to override.${NC}"
+        fi
+        if [ -z "$CUDA_PKG" ]; then
+            # Distro package as the last resort: old, but it does contain nvcc.
+            case "$PKG" in
+                apt)    CUDA_PKG="nvidia-cuda-toolkit" ;;
+                dnf|zypper) CUDA_PKG="cuda-toolkit" ;;
+            esac
+            echo -e "${YELLOW}   Falling back to the distribution package ($CUDA_PKG).${NC}"
+        fi
+        install_group "CUDA toolkit ($CUDA_PKG)" "$CUDA_PKG"
+    fi
 fi
 
 # ---------------------------------------------------------------------------

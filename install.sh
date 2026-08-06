@@ -857,8 +857,41 @@ if [ "$INSTALL_LLAMA_CPP" = true ] && [ "$LLAMA_TOOLCHAIN_OK" = true ]; then
             # the backend was detected from nvidia-smi, which ships with the
             # driver, not the toolkit. Distro CUDA packages land on PATH; the
             # .run and network installers put nvcc under /usr/local/cuda instead.
-            if ! command_exists nvcc && [ -x /usr/local/cuda/bin/nvcc ]; then
-                export PATH="/usr/local/cuda/bin:$PATH"
+            #
+            # A machine can carry both: Ubuntu 24.04's nvidia-cuda-toolkit is
+            # still CUDA 12, so a box that also has a current toolkit from
+            # NVIDIA's repository has an old /usr/bin/nvcc shadowing the new
+            # /usr/local/cuda/bin/nvcc. PATH order alone would build against the
+            # older one, so compare the two and take the newer.
+            _nvcc_version() {
+                "$1" --version 2>/dev/null |
+                    sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -1
+            }
+            if [ -x /usr/local/cuda/bin/nvcc ]; then
+                _path_nvcc="$(command -v nvcc 2>/dev/null || true)"
+                _local_v="$(_nvcc_version /usr/local/cuda/bin/nvcc)"
+                _path_v="$(_nvcc_version "${_path_nvcc:-/nonexistent}")"
+                if [ -z "$_path_nvcc" ] || {
+                        [ -n "$_local_v" ] && [ "$_path_v" != "$_local_v" ] &&
+                        [ "$(printf '%s\n%s\n' "$_path_v" "$_local_v" | sort -V | tail -1)" = "$_local_v" ]
+                   }; then
+                    export PATH="/usr/local/cuda/bin:$PATH"
+                fi
+            fi
+            if command_exists nvcc; then
+                _nv="$(_nvcc_version "$(command -v nvcc)")"
+                echo -e "${GREEN}   Using CUDA $_nv from $(command -v nvcc)${NC}"
+                # Minor versions are compatible within a major release, so only a
+                # major-version gap is a real problem: it compiles, then fails to
+                # initialise CUDA at runtime.
+                _drv="$(nvidia-smi 2>/dev/null |
+                    sed -n 's/.*CUDA Version:[[:space:]]*\([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -1)"
+                if [ -n "$_drv" ] && [ -n "$_nv" ] && [ "${_nv%%.*}" -gt "${_drv%%.*}" ] 2>/dev/null; then
+                    echo -e "${YELLOW}   Warning: the driver supports only up to CUDA $_drv.${NC}"
+                    echo -e "${YELLOW}   A CUDA $_nv build will compile but fail to run. Update the${NC}"
+                    echo -e "${YELLOW}   driver, or install a matching toolkit:${NC}"
+                    echo -e "${YELLOW}       bash install-deps.sh --cuda-version $_drv${NC}"
+                fi
             fi
             if ! command_exists nvcc; then
                 echo -e "${YELLOW}   nvcc not found: NVIDIA driver present but no CUDA toolkit.${NC}"

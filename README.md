@@ -120,20 +120,27 @@ header `nvidia-smi` prints must show `CUDA Version: 13.0` or higher.
 **Toolkit** — easiest through the dependency installer:
 
 ```bash
-bash install-deps.sh --cuda
+bash install-deps.sh --cuda                 # newest the driver supports
+bash install-deps.sh --cuda-version 13.0    # or pin a version
 ```
 
-or directly:
+This adds NVIDIA's own repository rather than using the distribution package.
+**Do not use `apt install nvidia-cuda-toolkit` if you want a current CUDA** —
+distro packages are frozen at whatever was current when the release was cut, so
+Ubuntu 24.04 still ships CUDA 12 while NVIDIA's repository carries 13.x.
 
-```bash
-sudo apt install -y nvidia-cuda-toolkit     # Debian, Ubuntu
-sudo dnf install -y cuda-toolkit            # Fedora, RHEL
-sudo pacman -S --needed cuda                # Arch, CachyOS
-```
+Newest is not always right, though, and `--cuda` accounts for it: `nvcc`
+produces binaries that need a driver from the same CUDA major version. Building
+`llama-cpp-python` with 13.x against a driver that only supports 12.x compiles
+cleanly and then fails at runtime. The version is therefore capped at what
+`nvidia-smi` reports the driver can run — update the driver first if you want a
+newer toolkit than it allows.
 
-NVIDIA's own [installer][cuda-dl] is the other route; it puts `nvcc` in
-`/usr/local/cuda/bin` rather than on `PATH`. The installer looks there anyway,
-but for your own shell:
+To add the repository by hand instead, follow NVIDIA's [download page][cuda-dl]
+for your distribution and install `cuda-toolkit`. Either way `nvcc` lands in
+`/usr/local/cuda/bin` rather than on `PATH`. `install.sh` looks there on its
+own — and prefers it over an older `/usr/bin/nvcc` if you have both — but for
+your own shell:
 
 ```bash
 export PATH="/usr/local/cuda/bin:$PATH"
