@@ -97,9 +97,17 @@ SUDOERS_FILE="/etc/sudoers.d/intentioned-restart"
 # Locate the install
 # ---------------------------------------------------------------------------
 
-# The launcher symlink is the most reliable record of where install.sh actually
-# put things — INSTALL_PATH is configurable and the caller may not remember what
-# they passed. Fall back to the documented default.
+# The launcher is the most reliable record of where install.sh actually put
+# things — INSTALL_PATH is configurable and the caller may not remember what
+# they passed. Current installs write a real script into ~/.local/bin whose
+# `cd` line names the install directory.
+if [ -z "$INSTALL_PATH" ] && [ -f "$USER_BIN/intentioned" ] && [ ! -L "$USER_BIN/intentioned" ]; then
+    INSTALL_PATH="$(sed -n 's/^cd "\(.*\)"$/\1/p' "$USER_BIN/intentioned" 2>/dev/null | head -1)"
+fi
+# Installs made before the launchers moved: ~/.local/bin/intentioned was a
+# symlink to $INSTALL_PATH/start-intentioned.sh, with the app nested one level
+# further down in $INSTALL_PATH/intentioned.tech. Removing $INSTALL_PATH still
+# takes the nested tree with it.
 if [ -z "$INSTALL_PATH" ] && [ -L "$USER_BIN/intentioned" ]; then
     _target="$(readlink -f "$USER_BIN/intentioned" 2>/dev/null || true)"
     [ -n "$_target" ] && INSTALL_PATH="$(dirname "$_target")"
@@ -107,7 +115,6 @@ fi
 if [ -z "$INSTALL_PATH" ]; then
     INSTALL_PATH="$HOME/.local/share/intentioned"
 fi
-REPO_PATH="$INSTALL_PATH/intentioned.tech"
 
 # Refuse to delete anything that is not clearly a private subdirectory. A
 # mistyped --install-path must not turn this into `rm -rf $HOME`, so require an
@@ -387,9 +394,12 @@ for _u in $USER_UNITS; do
 done
 # Matched on the venv interpreter's absolute path, so only processes belonging
 # to this install are signalled — never some other python running server.py.
-if [ -x "$REPO_PATH/myenv/bin/python" ]; then
-    pkill -f "^$REPO_PATH/myenv/bin/python" >/dev/null 2>&1 || true
-fi
+# Both layouts: the app sits in $INSTALL_PATH now, one level down before that.
+for _venv in "$INSTALL_PATH/myenv" "$INSTALL_PATH/intentioned.tech/myenv"; do
+    if [ -x "$_venv/bin/python" ]; then
+        pkill -f "^$_venv/bin/python" >/dev/null 2>&1 || true
+    fi
+done
 
 # 2. Unit files.
 echo -e "\n${YELLOW}[2/6] Removing systemd units...${NC}"

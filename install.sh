@@ -415,8 +415,99 @@ fi
 
 # Create installation directory
 echo -e "\n${YELLOW}[4/8] Creating installation directory...${NC}"
+
+# With --skip-repo-download the checkout already exists and IS the install; step
+# 5 resolves it. Creating (or migrating) the default path here would leave a
+# stray empty directory behind and misreport the location afterwards.
+if [ "$SKIP_REPO_DOWNLOAD" = true ]; then
+    echo -e "${GREEN}   Using an existing checkout; nothing to create ✓${NC}"
+else
+
+# The app is installed directly into $INSTALL_PATH — there is no extra
+# intentioned.tech/ level below it. Everything downstream (the launchers, the
+# desktop entries, merge-dist.sh on upgrade) records this path, so resolve it to
+# an absolute one first. A relative --install-path would otherwise produce
+# launchers that only work from the directory the installer happened to run in,
+# and a quoted "~/..." would create a directory literally named ~.
+case "$INSTALL_PATH" in
+    "~") INSTALL_PATH="$HOME" ;;
+    "~/"*) INSTALL_PATH="$HOME/${INSTALL_PATH#\~/}" ;;
+esac
 mkdir -p "$INSTALL_PATH"
+INSTALL_PATH="$(cd "$INSTALL_PATH" && pwd -P)"
 echo -e "${GREEN}   Path: $INSTALL_PATH ✓${NC}"
+
+# Migrate the old nested layout
+#
+# Installs made before the flattening put the app in
+# $INSTALL_PATH/intentioned.tech and the launchers beside it. Left alone, a
+# re-run would install afresh into $INSTALL_PATH and orphan the old tree —
+# taking config.json, the activation token and the TLS material with it, which
+# merge-dist.sh would no longer find to preserve. Lift the contents up instead.
+LEGACY_PATH="$INSTALL_PATH/intentioned.tech"
+if [ -d "$LEGACY_PATH" ] && [ -f "$LEGACY_PATH/requirements.txt" ]; then
+    echo -e "${YELLOW}   Found the old nested layout at $LEGACY_PATH${NC}"
+    echo -e "${YELLOW}   Moving it up into $INSTALL_PATH...${NC}"
+    # Regenerated below, and they would collide with the move.
+    rm -f "$INSTALL_PATH/start-intentioned.sh" "$INSTALL_PATH/config-intentioned.sh"
+    (
+        shopt -s dotglob nullglob
+        mv "$LEGACY_PATH"/* "$INSTALL_PATH"/
+    ) || {
+        echo -e "${RED}   Could not move the old install. Nothing was changed.${NC}" >&2
+        echo -e "${YELLOW}   Move it by hand, or install elsewhere with --install-path.${NC}" >&2
+        exit 1
+    }
+    rmdir "$LEGACY_PATH" 2>/dev/null || true
+
+    # A virtualenv bakes its own absolute path into the shebang of every console
+    # script and into bin/activate, so the move breaks it: bin/python is a
+    # symlink and still resolves, but ./myenv/bin/pip now starts with a
+    # `#!/old/path/myenv/bin/python3.12` that no longer exists.
+    #
+    # Rewriting those strings is what saves re-downloading several GB of torch.
+    # `python -m venv` over the existing directory does NOT do it — ensurepip
+    # skips pip when pip is already installed, so it exits 0 having changed
+    # nothing, and every console script keeps the stale shebang.
+    if [ -d "$INSTALL_PATH/myenv" ]; then
+        echo -e "${YELLOW}   Relocating the virtualenv to its new path...${NC}"
+        "$PYTHON_BIN" - "$INSTALL_PATH/myenv" "$LEGACY_PATH/myenv" "$INSTALL_PATH/myenv" <<'PY' || true
+import os, sys
+
+venv, old, new = sys.argv[1:4]
+old_b, new_b = old.encode(), new.encode()
+
+targets = [os.path.join(venv, "pyvenv.cfg")]
+bindir = os.path.join(venv, "bin")
+if os.path.isdir(bindir):
+    targets += [os.path.join(bindir, n) for n in os.listdir(bindir)]
+
+for path in targets:
+    # Symlinks point outside the venv (bin/python -> the base interpreter);
+    # following one would rewrite a file that is not ours.
+    if not os.path.isfile(path) or os.path.islink(path):
+        continue
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        continue
+    if b"\0" in data or old_b not in data:
+        continue
+    with open(path, "wb") as fh:
+        fh.write(data.replace(old_b, new_b))
+PY
+        if "$INSTALL_PATH/myenv/bin/pip" --version >/dev/null 2>&1; then
+            echo -e "${GREEN}   Virtualenv relocated ✓${NC}"
+        else
+            echo -e "${YELLOW}   Relocation failed; rebuilding it (dependencies re-download).${NC}"
+            rm -rf "$INSTALL_PATH/myenv"
+        fi
+    fi
+    echo -e "${GREEN}   Migrated to the flat layout ✓${NC}"
+fi
+
+fi  # end --skip-repo-download guard
 
 # Clone or update repository
 if [ "$SKIP_REPO_DOWNLOAD" = true ]; then
@@ -433,6 +524,9 @@ if [ "$SKIP_REPO_DOWNLOAD" = true ]; then
         echo -e "${YELLOW}     --skip-repo-download --repo-path /path/to/intentioned.tech${NC}" >&2
         exit 1
     fi
+    # The checkout is the install: keep the two in step so the launchers and the
+    # closing summary name the directory the app actually runs from.
+    INSTALL_PATH="$REPO_PATH"
     echo -e "${GREEN}   Using existing repo: $REPO_PATH ✓${NC}"
 elif [ "$SOURCE_MODE" = "git" ]; then
     # Maintainer path only: this clones the full proprietary source. It is NOT
@@ -441,7 +535,7 @@ elif [ "$SOURCE_MODE" = "git" ]; then
         echo -e "${RED}   --repo-path is only valid with --skip-repo-download${NC}" >&2
         exit 1
     fi
-    REPO_PATH="$INSTALL_PATH/intentioned.tech"
+    REPO_PATH="$INSTALL_PATH"
     echo -e "\n${YELLOW}[5/8] Cloning source (--from-git)...${NC}"
     # MAINTAINERS ONLY. The source repo is private, so this path fails with an
     # authentication error for anyone without access — which is intended. It is
@@ -471,7 +565,7 @@ else
         echo -e "${RED}   --repo-path is only valid with --skip-repo-download${NC}" >&2
         exit 1
     fi
-    REPO_PATH="$INSTALL_PATH/intentioned.tech"
+    REPO_PATH="$INSTALL_PATH"
     echo -e "\n${YELLOW}[5/8] Downloading your licensed build...${NC}"
 
     command_exists curl || { echo -e "${RED}   curl is required to download the release.${NC}" >&2; exit 1; }
@@ -964,29 +1058,38 @@ echo -e "${GREEN}   NeMo patches applied ✓${NC}"
 # Create start scripts
 echo -e "\n${YELLOW}[8/8] Creating launch scripts...${NC}"
 
-# Create start script
-cat > "$INSTALL_PATH/start-intentioned.sh" << EOF
+# The launchers live in ~/.local/bin, not in the install directory.
+#
+# Now that the app is installed directly into $INSTALL_PATH, a wrapper script
+# sitting there would be inside the tree merge-dist.sh rewrites on every
+# upgrade — and anything it removed would leave a dangling command behind.
+# Keeping them out of that tree also means $INSTALL_PATH holds the application
+# and nothing else.
+USER_BIN="$HOME/.local/bin"
+mkdir -p "$USER_BIN"
+
+# Replaces the symlink earlier versions created here.
+rm -f "$USER_BIN/intentioned" "$USER_BIN/intentioned-config"
+
+cat > "$USER_BIN/intentioned" << EOF
 #!/bin/bash
 cd "$REPO_PATH"
 source myenv/bin/activate
 python server.py
 EOF
-chmod +x "$INSTALL_PATH/start-intentioned.sh"
+chmod +x "$USER_BIN/intentioned"
 
-# Create config script
-cat > "$INSTALL_PATH/config-intentioned.sh" << EOF
+cat > "$USER_BIN/intentioned-config" << EOF
 #!/bin/bash
 cd "$REPO_PATH"
 source myenv/bin/activate
 python config_tool.py
 EOF
-chmod +x "$INSTALL_PATH/config-intentioned.sh"
+chmod +x "$USER_BIN/intentioned-config"
 
-# Create symlinks in user's bin directory
-USER_BIN="$HOME/.local/bin"
-mkdir -p "$USER_BIN"
-ln -sf "$INSTALL_PATH/start-intentioned.sh" "$USER_BIN/intentioned"
-ln -sf "$INSTALL_PATH/config-intentioned.sh" "$USER_BIN/intentioned-config"
+# Old installs kept the launchers beside the nested app directory. They point at
+# a path that no longer exists after the migration above.
+rm -f "$INSTALL_PATH/start-intentioned.sh" "$INSTALL_PATH/config-intentioned.sh"
 
 # Add to PATH if needed
 if [[ ":$PATH:" != *":$USER_BIN:"* ]]; then
@@ -1006,7 +1109,7 @@ Version=1.0
 Type=Application
 Name=Intentioned.tech
 Comment=Social Skills Training Platform
-Exec=$INSTALL_PATH/start-intentioned.sh
+Exec=$USER_BIN/intentioned
 Icon=$REPO_PATH/favicon.ico
 Terminal=true
 Categories=Education;
@@ -1018,7 +1121,7 @@ Version=1.0
 Type=Application
 Name=Intentioned.tech Config
 Comment=Intentioned.tech Configuration Tool
-Exec=$INSTALL_PATH/config-intentioned.sh
+Exec=$USER_BIN/intentioned-config
 Icon=$REPO_PATH/favicon.ico
 Terminal=false
 Categories=Education;Settings;
@@ -1033,11 +1136,11 @@ echo "║                  Installation Complete! 🎉                     ║"
 echo "╠═══════════════════════════════════════════════════════════════╣"
 echo "║  To start Intentioned.tech:                                        ║"
 echo "║    intentioned                                                 ║"
-echo "║    or: $INSTALL_PATH/start-intentioned.sh                      "
+echo "║    or: $USER_BIN/intentioned                      "
 echo "║                                                                ║"
 echo "║  To configure:                                                 ║"
 echo "║    intentioned-config                                          ║"
-echo "║    or: $INSTALL_PATH/config-intentioned.sh                     "
+echo "║    or: $USER_BIN/intentioned-config                     "
 echo "║                                                                ║"
 echo "║  Installation path: $INSTALL_PATH                              "
 echo "╚═══════════════════════════════════════════════════════════════╝"

@@ -58,6 +58,21 @@ arguments are visible to every local user through `/proc`.
 
 ## Options
 
+### Where things go
+
+```
+~/.local/share/intentioned/     the application, its myenv virtualenv,
+                                config.json and TLS material
+~/.local/bin/intentioned        launcher
+~/.local/bin/intentioned-config configuration tool
+```
+
+`--install-path` sets the first of those, and the app is written **directly**
+into it — there is no extra `intentioned.tech/` level below it. Installs made
+before this changed are migrated automatically on the next run: the nested
+directory is lifted up, and the virtualenv is relocated in place rather than
+rebuilt, so nothing is re-downloaded.
+
 | Flag | Description |
 | --- | --- |
 | `--backend cuda\|rocm\|cpu` | Force a compute backend (default: auto-detect) |
