@@ -97,9 +97,13 @@ installer builds llama-cpp-python CPU-only, which still loads GGUF models.
 
 ## Emergency uninstall
 
-Removes everything the installer put on the machine — the application, the
+Returns the machine to a pre-development state. Removes the application, the
 virtualenv, launchers, desktop entries, systemd units, the sudoers rule, the
-PATH line added to your shell rc, and the model and build caches.
+PATH line added to your shell rc, the model and build caches — **and the
+development toolchain itself**: gcc, g++, make, cmake, ninja, pkg-config, the
+CUDA toolkit, Tk, the Python headers and ffmpeg.
+
+Pair it with `install-deps.sh` to demo a clean install from a bare machine.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/intentioned-tech/install/main/emergency-uninstall.sh -o emergency-uninstall.sh
@@ -117,17 +121,38 @@ It prints every path it will delete, with sizes, and requires you to type
 | `--keep-models` | Keep `~/.cache/huggingface` and `~/.cache/torch` |
 | `--keep-cache` | Keep the pip cache too |
 | `--keep-shell-rc` | Do not touch `~/.bashrc` / `~/.zshrc` |
-| `--system-packages` | Also remove the build toolchain, Tk, ffmpeg and the CUDA toolkit |
+| `--keep-system-packages` | Keep gcc, cmake, CUDA, Tk and ffmpeg — remove only the app and its caches |
 | `-y`, `--yes` | Skip the typed confirmation |
 
-**GPU drivers are never removed**, with or without `--system-packages`: driver,
-kernel-module and display-stack packages are filtered out of the removal list.
-`git`, `curl` and your Python installations are left alone for the same reason —
-they predate this app and other tooling depends on them.
+### What survives
 
-`--system-packages` is off by default because those packages are shared with the
-rest of your system. Without it the uninstall is confined to the install path,
-the launchers, and the caches.
+**GPU drivers are never removed.** Neither are kernel modules, the display
+stack, or the C runtime (`libgcc-s1`, `libstdc++6`, `gcc-N-base`, `libc6`) that
+every binary on the machine links against. `git`, `curl` and your Python
+interpreters are left alone too — they predate this app and other tooling
+depends on them.
+
+Keeping the driver while removing gcc and CUDA is the hard part: `cuda`,
+`cuda-drivers` and `nvidia-driver-*` share a dependency graph, and Fedora's
+`akmod-nvidia` pulls in gcc to build its kernel module, so a naive "remove gcc
+and cuda" takes the driver with it. Three independent guards:
+
+1. a curated list of what may be considered at all — never a blanket wildcard
+   over installed packages;
+2. a protected pattern (drivers, kernel modules, display stack, C runtime)
+   subtracted from that list;
+3. a package-manager **simulation** of every removal, with the candidate
+   dropped if the simulated transaction touches anything protected. This is
+   what catches the indirect cases the first two guards cannot see.
+
+No orphan sweep is used — no `apt --auto-remove`, no `pacman -Rs`, no
+`zypper --clean-deps`. Depth comes from naming `gcc`, `cpp-N`,
+`libstdc++-N-dev` and friends explicitly, because an orphan sweep is exactly
+how "remove gcc" ends up removing a DKMS-built driver. Support libraries left
+behind are harmless; `apt autoremove` will collect them if you want.
+
+After removing packages the script re-runs `nvidia-smi` (and `rocminfo`) and
+reports whether the driver still works.
 
 ## How licensing works
 

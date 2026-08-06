@@ -25,7 +25,7 @@ ASSUME_YES=false
 KEEP_MODELS=false
 KEEP_CACHE=false
 KEEP_SHELL_RC=false
-SYSTEM_PACKAGES=false
+KEEP_SYSTEM_PACKAGES=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -35,15 +35,20 @@ while [[ $# -gt 0 ]]; do
         --keep-models)    KEEP_MODELS=true; shift ;;
         --keep-cache)     KEEP_CACHE=true; shift ;;
         --keep-shell-rc)  KEEP_SHELL_RC=true; shift ;;
-        --system-packages) SYSTEM_PACKAGES=true; shift ;;
+        --keep-system-packages) KEEP_SYSTEM_PACKAGES=true; shift ;;
+        # Accepted and ignored: removing system packages is the default now.
+        --system-packages) shift ;;
         -h|--help)
             echo "Intentioned.tech emergency uninstaller"
             echo ""
             echo "Usage: bash emergency-uninstall.sh [OPTIONS]"
             echo ""
             echo "Removes the application, its virtualenv, launchers, desktop entries,"
-            echo "systemd units, the sudoers rule, and the model/build caches."
-            echo "GPU drivers are never removed."
+            echo "systemd units, the sudoers rule, the model/build caches, AND the"
+            echo "development toolchain: gcc, make, cmake, ninja, the CUDA toolkit, Tk"
+            echo "and the Python headers."
+            echo ""
+            echo "GPU drivers, kernel modules and the C runtime are never removed."
             echo ""
             echo "Options:"
             echo "  --install-path PATH  Install location to remove"
@@ -55,10 +60,9 @@ while [[ $# -gt 0 ]]; do
             echo "                       ML projects on this machine)"
             echo "  --keep-cache         Keep the pip cache too"
             echo "  --keep-shell-rc      Do not touch ~/.bashrc / ~/.zshrc"
-            echo "  --system-packages    ALSO remove the build toolchain, Tk, ffmpeg and the"
-            echo "                       CUDA toolkit via your package manager. Off by default:"
-            echo "                       these are shared with the rest of your system."
-            echo "                       Drivers are excluded even with this flag."
+            echo "  --keep-system-packages"
+            echo "                       Keep gcc, cmake, CUDA, Tk and ffmpeg. Use this to"
+            echo "                       remove only the app and its caches."
             echo "  -h, --help           Show this message"
             exit 0
             ;;
@@ -160,47 +164,122 @@ if [ "$PLATFORM" = "Linux" ] && command_exists systemctl; then
     USER_UNITS="$(systemctl --user list-unit-files --no-legend --no-pager 'intentioned*' 2>/dev/null | awk '{print $1}' || true)"
 fi
 
-# Package groups, mirroring install-deps.sh. git, curl and ca-certificates are
-# deliberately absent: they predate this app on any real machine and removing
-# them breaks unrelated tooling.
+# ---------------------------------------------------------------------------
+# System packages
+#
+# This is a deep clean: the compiler itself goes, along with cmake, ninja, the
+# CUDA toolkit, Tk and the Python headers — the machine ends up as if it had
+# never built anything. The GPU driver stays.
+#
+# That distinction is the whole difficulty. `cuda`, `cuda-drivers` and
+# `nvidia-driver-*` sit in one dependency graph, and `akmod-nvidia` on Fedora
+# pulls in gcc to build its kernel module, so a naive "remove gcc and cuda"
+# takes the driver with it. Three independent guards below:
+#
+#   1. a curated pattern of what may be considered at all, never a blanket
+#      wildcard over installed packages;
+#   2. a protected pattern (drivers, kernel modules, display stack, and the C
+#      runtime every binary on the system links against) subtracted from it;
+#   3. a package-manager *simulation* of each removal, with the candidate
+#      dropped if the simulated transaction touches anything protected. This
+#      is what catches the indirect cases the first two cannot see.
+# ---------------------------------------------------------------------------
+
+# Drivers, kernel modules, display stack. Losing these is not a recoverable
+# "oops" on a headless box. cuda-drivers is here rather than with the toolkit
+# because it is the driver metapackage, despite the name.
+DRIVER_RE='(nvidia-driver|nvidia-dkms|nvidia-utils|nvidia-kernel|nvidia-firmware|nvidia-compute|nvidia-persistenced|nvidia-settings|nvidia-prime|nvidia-modprobe|nvidia-open|libnvidia|cuda-drivers|akmod-nvidia|kmod-nvidia|dkms|linux-headers|linux-image|linux-modules|kernel-devel|kernel-core|amdgpu|xf86-video|mesa|xserver|xorg|rocm|hip-runtime|libdrm)'
+
+# The C runtime, not the C compiler. libgcc-s1 and libstdc++6 are linked by
+# essentially every binary on the box, and gcc-N-base is their common parent —
+# removing any of them is a bricked system, not a clean demo machine.
+PROTECTED_RE="(^gcc-[0-9.]+-base$|^libgcc-s1$|^libgcc1$|^libstdc\+\+6$|^libc6$|^libc-bin$|^glibc$|^libgcc$|^libstdc\+\+$|$DRIVER_RE)"
+
+# What a deep clean is allowed to consider. Deliberately absent: git, curl,
+# ca-certificates and the Python interpreters. They predate this app on any real
+# machine and removing them breaks unrelated tooling.
+case "$PLATFORM" in
+    macOS) DEV_RE='^(cmake|ninja|pkg-config|ffmpeg|zstd|python-tk(@.*)?)$' ;;
+    *)     DEV_RE='^(build-essential|gcc|g\+\+|cpp|gcc-[0-9]+|g\+\+-[0-9]+|cpp-[0-9]+|gcc-c\+\+|libstdc\+\+-[0-9]+-dev|libstdc\+\+-devel|libgcc-[0-9]+-dev|libc6-dev|libc-dev-bin|glibc-devel|linux-libc-dev|make|cmake|cmake-data|ninja|ninja-build|pkg-config|pkgconf|pkgconf-bin|libpkgconf[0-9]*|pkgconfig|ffmpeg|zstd|tk|python3(\.[0-9]+)?-tk|python3(\.[0-9]+)?-dev|python3(\.[0-9]+)?-devel|python3(\.[0-9]+)?-tkinter|python[0-9]+-tk|python[0-9]+-devel|libpython3(\.[0-9]+)?-dev|nvidia-cuda-toolkit|nvidia-cuda-dev|cuda|cuda-toolkit.*|cuda-[a-z].*|libcudnn.*|libcublas.*|libcufft.*|libcurand.*|libcusolver.*|libcusparse.*|libnpp.*|libnvjitlink.*|libnvrtc.*|libnvjpeg.*)$' ;;
+esac
+
 PKG=""
-REMOVE_PKGS=""
-if [ "$SYSTEM_PACKAGES" = true ]; then
-    if [ "$PLATFORM" = "macOS" ]; then
-        PKG="brew"
-        REMOVE_PKGS="cmake ninja pkg-config ffmpeg zstd"
-    elif command_exists apt-get; then
-        PKG="apt"
-        REMOVE_PKGS="build-essential cmake ninja-build pkg-config ffmpeg zstd python3-tk nvidia-cuda-toolkit"
-        for _v in 9 10 11 12 13 14; do
-            REMOVE_PKGS="$REMOVE_PKGS python3.$_v-tk python3.$_v-dev"
-        done
-    elif command_exists dnf; then
-        PKG="dnf"
-        REMOVE_PKGS="gcc-c++ cmake ninja-build pkgconfig ffmpeg zstd python3-tkinter cuda-toolkit"
-    elif command_exists pacman; then
-        PKG="pacman"
-        REMOVE_PKGS="cmake ninja pkgconf ffmpeg zstd tk cuda"
-    elif command_exists zypper; then
-        PKG="zypper"
-        REMOVE_PKGS="gcc-c++ cmake ninja pkg-config ffmpeg zstd python3-tk cuda-toolkit"
-    fi
+if [ "$PLATFORM" = "macOS" ]; then
+    command_exists brew && PKG="brew"
+elif command_exists apt-get; then PKG="apt"
+elif command_exists dnf;     then PKG="dnf"
+elif command_exists pacman;  then PKG="pacman"
+elif command_exists zypper;  then PKG="zypper"
 fi
 
-# Belt and braces over the hand-written lists above: drop anything that looks
-# like a driver, a kernel module or a display stack even if it was listed by
-# mistake. Losing the GPU driver is not a recoverable "oops" on a headless box.
-DRIVER_PATTERN='^(nvidia-driver|nvidia-dkms|nvidia-utils|nvidia-kernel|libnvidia|nvidia-open|linux-headers|linux-image|amdgpu|xf86-video|mesa|xserver|rocm|hip-runtime|kmod)'
+# Installed packages, one name per line.
+installed_packages() {
+    case "$PKG" in
+        apt)    dpkg-query -W -f='${db:Status-Abbrev} ${binary:Package}\n' 2>/dev/null |
+                    awk '/^i/ {print $2}' | sed 's/:.*$//' ;;
+        dnf|zypper) rpm -qa --qf '%{NAME}\n' 2>/dev/null ;;
+        pacman) pacman -Qq 2>/dev/null ;;
+        brew)   brew list --formula 2>/dev/null ;;
+    esac
+}
+
+# Text of the transaction the manager *would* perform. Parsed only well enough
+# to spot protected names in it, so an unparsed line is harmless — it simply
+# fails to match and the candidate is kept.
+#
+# No --auto-remove / --clean-deps / -s anywhere: the depth of this uninstall
+# comes from the curated list naming gcc, cpp-N, libstdc++-N-dev and friends
+# explicitly, not from letting the package manager sweep orphans. An orphan
+# sweep is precisely how `remove gcc` ends up removing a DKMS-built driver.
+simulate_removal() {
+    case "$PKG" in
+        apt)    apt-get purge -s "$@" 2>/dev/null | grep -E '^(Remv|Purg)' || true ;;
+        dnf)    dnf remove --assumeno --setopt=clean_requirements_on_remove=False "$@" 2>&1 || true ;;
+        pacman) pacman -Rnp --print-format '%n' "$@" 2>/dev/null || true ;;
+        zypper) zypper --non-interactive remove --dry-run "$@" 2>&1 || true ;;
+        brew)   echo "$*" ;;   # brew never removes a formula's dependents
+    esac
+}
+
+# True when a simulated transaction would touch something protected. The text is
+# split on whitespace so the anchored entries in PROTECTED_RE match whole
+# package names; apt's trailing "[version]" fields are stripped first.
+touches_protected() {
+    [ -n "$1" ] || return 1
+    printf '%s\n' "$1" | tr -s ' \t' '\n\n' | sed 's/^\[.*//' | grep -qE "$PROTECTED_RE"
+}
+
+REMOVE_PKGS=""
+SKIPPED_PKGS=""
 KEPT_DRIVERS=""
-FILTERED_PKGS=""
-for _p in $REMOVE_PKGS; do
-    if [[ "$_p" =~ $DRIVER_PATTERN ]]; then
-        KEPT_DRIVERS="$KEPT_DRIVERS $_p"
-    else
-        FILTERED_PKGS="$FILTERED_PKGS $_p"
+BATCH_SAFE=true
+if [ "$KEEP_SYSTEM_PACKAGES" != true ] && [ -n "$PKG" ]; then
+    echo -e "${YELLOW}Working out which development packages can be removed safely...${NC}"
+    for _p in $(installed_packages | sort -u); do
+        # Guard 1+2: in the curated set, and not itself protected.
+        printf '%s' "$_p" | grep -qE "$DEV_RE" || continue
+        if printf '%s' "$_p" | grep -qE "$PROTECTED_RE"; then
+            KEPT_DRIVERS="$KEPT_DRIVERS $_p"
+            continue
+        fi
+        # Guard 3: would removing this drag a protected package out with it?
+        if touches_protected "$(simulate_removal "$_p")"; then
+            SKIPPED_PKGS="$SKIPPED_PKGS $_p"
+            continue
+        fi
+        REMOVE_PKGS="$REMOVE_PKGS $_p"
+    done
+
+    # Removals interact: a set can orphan something no single member would.
+    # Re-simulate the whole list and fall back to package-at-a-time if so.
+    BATCH_SAFE=true
+    if [ -n "$REMOVE_PKGS" ]; then
+        # shellcheck disable=SC2086
+        if touches_protected "$(simulate_removal $REMOVE_PKGS)"; then
+            BATCH_SAFE=false
+        fi
     fi
-done
-REMOVE_PKGS="$FILTERED_PKGS"
+fi
 
 # ---------------------------------------------------------------------------
 # Show the plan
@@ -240,9 +319,24 @@ fi
 if [ -n "$REMOVE_PKGS" ]; then
     echo ""
     echo -e "${YELLOW}Will remove these system packages via ${PKG}:${NC}"
-    echo -e "${RED}  $REMOVE_PKGS${NC}"
-    echo -e "${GREEN}Drivers are excluded and stay installed.${NC}"
-    [ -n "$KEPT_DRIVERS" ] && echo -e "${GREEN}Filtered out as driver-adjacent:$KEPT_DRIVERS${NC}"
+    printf '%s\n' $REMOVE_PKGS | sed 's/^/   /' | while IFS= read -r _l; do
+        echo -e "${RED}$_l${NC}"
+    done
+    if [ -n "$KEPT_DRIVERS" ]; then
+        echo -e "${GREEN}Protected (driver / kernel / C runtime), staying installed:${NC}"
+        printf '%s\n' $KEPT_DRIVERS | sed 's/^/   /'
+    fi
+    if [ -n "$SKIPPED_PKGS" ]; then
+        echo -e "${GREEN}Skipped — removing these would have taken a protected package too:${NC}"
+        printf '%s\n' $SKIPPED_PKGS | sed 's/^/   /'
+    fi
+    if [ "$BATCH_SAFE" != true ]; then
+        echo -e "${YELLOW}Batch removal would touch a protected package; removing one at a${NC}"
+        echo -e "${YELLOW}time instead and skipping any that turns unsafe.${NC}"
+    fi
+elif [ "$KEEP_SYSTEM_PACKAGES" = true ]; then
+    echo ""
+    echo -e "${GREEN}Keeping the toolchain, CUDA, Tk and ffmpeg (--keep-system-packages).${NC}"
 fi
 
 if [ "$KEEP_MODELS" = true ]; then
@@ -357,37 +451,55 @@ else
     echo -e "${GREEN}   Shell configuration clean ✓${NC}"
 fi
 
-# 6. System packages (opt-in).
-echo -e "\n${YELLOW}[6/6] Removing system packages...${NC}"
+# 6. System packages: the toolchain, CUDA, Tk, ffmpeg.
+echo -e "\n${YELLOW}[6/6] Removing development packages...${NC}"
 if [ -z "$REMOVE_PKGS" ]; then
-    echo -e "${GREEN}   Skipped (pass --system-packages to include them) ✓${NC}"
+    if [ "$KEEP_SYSTEM_PACKAGES" = true ]; then
+        echo -e "${GREEN}   Skipped (--keep-system-packages) ✓${NC}"
+    else
+        echo -e "${GREEN}   Nothing removable found ✓${NC}"
+    fi
 else
-    case "$PKG" in
-        apt)
-            # --auto-remove sweeps up dependencies that only these packages
-            # pulled in; ignore-missing keeps a package that was never installed
-            # from failing the whole run.
-            # shellcheck disable=SC2086
-            _as_root apt-get purge -y --auto-remove --ignore-missing $REMOVE_PKGS || true
-            ;;
-        dnf)
-            # shellcheck disable=SC2086
-            _as_root dnf remove -y $REMOVE_PKGS || true
-            ;;
-        pacman)
-            # shellcheck disable=SC2086
-            _as_root pacman -Rns --noconfirm $REMOVE_PKGS || true
-            ;;
-        zypper)
-            # shellcheck disable=SC2086
-            _as_root zypper --non-interactive remove --clean-deps $REMOVE_PKGS || true
-            ;;
-        brew)
-            # shellcheck disable=SC2086
-            brew uninstall $REMOVE_PKGS || true
-            ;;
-    esac
-    echo -e "${GREEN}   System packages removed ✓${NC}"
+    do_removal() {
+        case "$PKG" in
+            apt)    _as_root apt-get purge -y "$@" ;;
+            dnf)    _as_root dnf remove -y --setopt=clean_requirements_on_remove=False "$@" ;;
+            pacman) _as_root pacman -Rn --noconfirm "$@" ;;
+            zypper) _as_root zypper --non-interactive remove "$@" ;;
+            brew)   brew uninstall "$@" ;;
+        esac
+    }
+
+    if [ "$BATCH_SAFE" = true ]; then
+        # shellcheck disable=SC2086
+        do_removal $REMOVE_PKGS || BATCH_SAFE=false
+    fi
+    if [ "$BATCH_SAFE" != true ]; then
+        # One at a time, re-simulating each against the machine's *current*
+        # state — earlier removals change what the next one would cascade into.
+        for _p in $REMOVE_PKGS; do
+            if touches_protected "$(simulate_removal "$_p")"; then
+                echo -e "${YELLOW}   skipped $_p (would take a protected package)${NC}"
+                continue
+            fi
+            do_removal "$_p" >/dev/null 2>&1 || echo -e "${YELLOW}   skipped $_p (removal failed)${NC}"
+        done
+    fi
+    echo -e "${GREEN}   Development packages removed ✓${NC}"
+    echo -e "${YELLOW}   Orphaned support libraries are left in place on purpose — an${NC}"
+    echo -e "${YELLOW}   orphan sweep is how 'remove gcc' ends up removing a DKMS driver.${NC}"
+
+    # The one claim this script makes that is worth verifying out loud.
+    if command_exists nvidia-smi; then
+        if nvidia-smi >/dev/null 2>&1; then
+            echo -e "${GREEN}   NVIDIA driver still working ✓${NC}"
+        else
+            echo -e "${YELLOW}   nvidia-smi present but not responding; a reboot may be pending.${NC}"
+        fi
+    fi
+    if command_exists rocminfo && rocminfo >/dev/null 2>&1; then
+        echo -e "${GREEN}   ROCm runtime still working ✓${NC}"
+    fi
 fi
 
 echo -e "${GREEN}"
