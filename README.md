@@ -11,8 +11,13 @@ credentials.
 
 - Linux or macOS
 - Python 3.12 (the installer can set this up for you)
+- A C/C++ compiler, for the `llama-cpp-python` (GGUF) build — the installer
+  offers to install one (`build-essential` / `base-devel` / Xcode CLI tools).
+  Skip the build with `--no-llama-cpp` if you do not need GGUF models.
 - An Intentioned.tech licence (username + password)
-- NVIDIA CUDA, AMD ROCm, or CPU — the backend is auto-detected
+- NVIDIA CUDA, AMD ROCm, or CPU — the backend is auto-detected. GPU offload for
+  GGUF also needs the CUDA toolkit (`nvcc`), not just the driver; without it the
+  installer builds llama-cpp-python CPU-only.
 
 ## Install
 

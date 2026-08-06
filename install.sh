@@ -235,7 +235,7 @@ else
 fi
 
 # Check for ffmpeg
-echo -e "\n${YELLOW}[3/7] Checking ffmpeg installation...${NC}"
+echo -e "\n${YELLOW}[3/7] Checking ffmpeg and C/C++ build tools...${NC}"
 if command_exists ffmpeg; then
     FFMPEG_VERSION=$(ffmpeg -version 2>&1 | head -n1)
     echo -e "${GREEN}   Found: $FFMPEG_VERSION ✓${NC}"
@@ -251,6 +251,84 @@ else
         fi
     elif [ "$PLATFORM" = "macOS" ]; then
         brew install ffmpeg
+    fi
+fi
+
+# Check for a C/C++ toolchain (llama-cpp-python is built from source)
+#
+# llama-cpp-python publishes no Linux wheels, so every install compiles the
+# 71 MB sdist. scikit-build-core injects Python's *sysconfig* CC/CXX into the
+# CMake environment whenever they are unset (builder/generator.py). On Debian
+# and Ubuntu those are the triplet names `x86_64-linux-gnu-gcc` / `-g++`, which
+# exist only when gcc is actually installed, so a host without build-essential
+# fails during configure with
+#     Could not find the compiler specified in the environment variable CC
+# before any CUDA or HIP flag is even considered. Resolving a real toolchain
+# here — and exporting it later — means sysconfig's guess is never consulted.
+#
+# Checked at step 3 rather than at build time so the failure lands before the
+# multi-gigabyte PyTorch download, not after it.
+CC_BIN=""
+CXX_BIN=""
+LLAMA_COMPILER_ARGS=""
+LLAMA_TOOLCHAIN_OK=false
+
+resolve_compilers() {
+    CC_BIN=""
+    CXX_BIN=""
+    # $CC/$CXX win when they point at something real; a stale value (the
+    # sysconfig triplet, a compiler removed since the venv was made) falls
+    # through to whatever this system actually has.
+    for _c in "${CC:-}" cc gcc clang; do
+        [ -n "$_c" ] || continue
+        if command_exists "$_c"; then CC_BIN="$(command -v "$_c")"; break; fi
+    done
+    for _x in "${CXX:-}" c++ g++ clang++; do
+        [ -n "$_x" ] || continue
+        if command_exists "$_x"; then CXX_BIN="$(command -v "$_x")"; break; fi
+    done
+    [ -n "$CC_BIN" ] && [ -n "$CXX_BIN" ]
+}
+
+if [ "$INSTALL_LLAMA_CPP" != true ]; then
+    echo -e "${YELLOW}   Skipping compiler check (--no-llama-cpp).${NC}"
+elif resolve_compilers; then
+    echo -e "${GREEN}   Found: $CC_BIN, $CXX_BIN ✓${NC}"
+    LLAMA_TOOLCHAIN_OK=true
+else
+    echo -e "${YELLOW}   No C/C++ compiler found (needed to build llama-cpp-python). Installing...${NC}"
+    # Every branch is `|| true`: under `set -e` a missing sudo or a declined
+    # password would otherwise abort an install that can still finish without
+    # GGUF. A failure here just leaves LLAMA_TOOLCHAIN_OK false.
+    _as_root() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo "$@"; fi; }
+    if [ "$PLATFORM" = "Linux" ]; then
+        if command_exists apt-get; then
+            _as_root apt-get install -y build-essential || true
+        elif command_exists dnf; then
+            _as_root dnf install -y gcc gcc-c++ make || true
+        elif command_exists pacman; then
+            _as_root pacman -S --needed --noconfirm base-devel || true
+        elif command_exists zypper; then
+            _as_root zypper install -y gcc gcc-c++ make || true
+        fi
+    elif [ "$PLATFORM" = "macOS" ]; then
+        xcode-select --install 2>/dev/null || true
+    fi
+    if resolve_compilers; then
+        echo -e "${GREEN}   Found: $CC_BIN, $CXX_BIN ✓${NC}"
+        LLAMA_TOOLCHAIN_OK=true
+    else
+        echo -e "${RED}   Still no C/C++ compiler. GGUF support will be skipped.${NC}"
+        echo -e "${YELLOW}   Install one and re-run, or pass --no-llama-cpp to silence this:${NC}"
+        if [ "$PLATFORM" = "macOS" ]; then
+            echo -e "${YELLOW}       xcode-select --install${NC}"
+        elif command_exists dnf; then
+            echo -e "${YELLOW}       sudo dnf install -y gcc gcc-c++ make${NC}"
+        elif command_exists pacman; then
+            echo -e "${YELLOW}       sudo pacman -S --needed base-devel${NC}"
+        else
+            echo -e "${YELLOW}       sudo apt-get install -y build-essential${NC}"
+        fi
     fi
 fi
 
@@ -548,37 +626,73 @@ if [ "$SELECTED_BACKEND" = "rocm" ]; then
     ./myenv/bin/pip uninstall -y bitsandbytes cuda-python >/dev/null 2>&1 || true
 fi
 
-if [ "$INSTALL_LLAMA_CPP" = true ]; then
+if [ "$INSTALL_LLAMA_CPP" = true ] && [ "$LLAMA_TOOLCHAIN_OK" = true ]; then
     echo -e "${YELLOW}   Building llama-cpp-python for ${SELECTED_BACKEND} (GGUF support)...${NC}"
+
+    # Pin the toolchain resolved in [3/7] two ways: exported, so scikit-build-core
+    # leaves its sysconfig CC/CXX defaults alone, and as cache variables, so an
+    # inherited CC/CXX from the caller's shell cannot win either.
+    export CC="$CC_BIN"
+    export CXX="$CXX_BIN"
+    LLAMA_COMPILER_ARGS="-DCMAKE_C_COMPILER=${CC_BIN} -DCMAKE_CXX_COMPILER=${CXX_BIN}"
+
+    # Shared last resort. A CPU-only build still loads GGUF models — it only
+    # gives up GPU offload — so it beats disabling GGUF outright. Any arguments
+    # are appended to CMAKE_ARGS, for backend-specific flags to switch off.
+    _llama_cpu_fallback() {
+        echo -e "${YELLOW}   Falling back to a CPU-only llama-cpp-python build (GGUF works, no GPU offload)...${NC}"
+        FORCE_CMAKE=1 CMAKE_ARGS="-DGGML_CUDA=OFF ${LLAMA_COMPILER_ARGS} $*" \
+            ./myenv/bin/pip install --upgrade --no-cache-dir --no-binary llama-cpp-python \
+            'llama-cpp-python>=0.3.0' || \
+            echo -e "${YELLOW}   llama-cpp-python CPU build failed; GGUF disabled.${NC}"
+    }
+
+    # CUDA's host_config.h caps the supported host GCC (e.g. CUDA 13.x
+    # rejects GCC 16). On rolling-release distros (Arch/CachyOS) the
+    # system gcc can exceed that cap, failing the build with
+    # "unsupported GNU version". Detect a compatible older gcc-N/g++-N
+    # and pin it as the CUDA host compiler (and C/C++ compiler, so the
+    # host and device object files share one libstdc++ ABI).
+    _llama_cuda_build() {
+        CUDA_HOST_ARGS=""
+        _maxg=15
+        _hc="$(dirname "$(dirname "$(readlink -f "$(command -v nvcc 2>/dev/null)" 2>/dev/null)")" 2>/dev/null)/targets/x86_64-linux/include/crt/host_config.h"
+        if [ -f "$_hc" ]; then
+            _g="$(grep -oE '__GNUC__ > [0-9]+' "$_hc" | grep -oE '[0-9]+' | head -1)"
+            [ -n "$_g" ] && _maxg="$_g"
+        fi
+        _curg="$(gcc -dumpversion 2>/dev/null | cut -d. -f1)"
+        if [ -n "$_curg" ] && [ "$_curg" -gt "$_maxg" ]; then
+            for _v in $(seq "$_maxg" -1 9); do
+                if command -v "gcc-$_v" >/dev/null 2>&1 && command -v "g++-$_v" >/dev/null 2>&1; then
+                    CUDA_HOST_ARGS="-DCMAKE_C_COMPILER=$(command -v "gcc-$_v") -DCMAKE_CXX_COMPILER=$(command -v "g++-$_v") -DCMAKE_CUDA_HOST_COMPILER=$(command -v "g++-$_v")"
+                    echo -e "${YELLOW}   System gcc $_curg > CUDA max $_maxg; pinning gcc-$_v as CUDA host compiler.${NC}"
+                    break
+                fi
+            done
+            [ -z "$CUDA_HOST_ARGS" ] && echo -e "${YELLOW}   System gcc $_curg > CUDA max $_maxg and no older gcc-N found; CUDA build may fail. Install gcc-$_maxg (e.g. 'gcc15' on Arch).${NC}"
+        fi
+        CMAKE_ARGS="-DGGML_CUDA=on ${CUDA_HOST_ARGS:-$LLAMA_COMPILER_ARGS}" \
+            ./myenv/bin/pip install --upgrade --no-cache-dir 'llama-cpp-python>=0.3.0'
+    }
+
     case "$SELECTED_BACKEND" in
         cuda)
-            # CUDA's host_config.h caps the supported host GCC (e.g. CUDA 13.x
-            # rejects GCC 16). On rolling-release distros (Arch/CachyOS) the
-            # system gcc can exceed that cap, failing the build with
-            # "unsupported GNU version". Detect a compatible older gcc-N/g++-N
-            # and pin it as the CUDA host compiler (and C/C++ compiler, so the
-            # host and device object files share one libstdc++ ABI).
-            CUDA_HOST_ARGS=""
-            _maxg=15
-            _hc="$(dirname "$(dirname "$(readlink -f "$(command -v nvcc 2>/dev/null)" 2>/dev/null)")" 2>/dev/null)/targets/x86_64-linux/include/crt/host_config.h"
-            if [ -f "$_hc" ]; then
-                _g="$(grep -oE '__GNUC__ > [0-9]+' "$_hc" | grep -oE '[0-9]+' | head -1)"
-                [ -n "$_g" ] && _maxg="$_g"
+            # GGML_CUDA=on turns on CMake's CUDA language, which needs nvcc — and
+            # the backend was detected from nvidia-smi, which ships with the
+            # driver, not the toolkit. Distro CUDA packages land on PATH; the
+            # .run and network installers put nvcc under /usr/local/cuda instead.
+            if ! command_exists nvcc && [ -x /usr/local/cuda/bin/nvcc ]; then
+                export PATH="/usr/local/cuda/bin:$PATH"
             fi
-            _curg="$(gcc -dumpversion 2>/dev/null | cut -d. -f1)"
-            if [ -n "$_curg" ] && [ "$_curg" -gt "$_maxg" ]; then
-                for _v in $(seq "$_maxg" -1 9); do
-                    if command -v "gcc-$_v" >/dev/null 2>&1 && command -v "g++-$_v" >/dev/null 2>&1; then
-                        CUDA_HOST_ARGS="-DCMAKE_C_COMPILER=$(command -v "gcc-$_v") -DCMAKE_CXX_COMPILER=$(command -v "g++-$_v") -DCMAKE_CUDA_HOST_COMPILER=$(command -v "g++-$_v")"
-                        echo -e "${YELLOW}   System gcc $_curg > CUDA max $_maxg; pinning gcc-$_v as CUDA host compiler.${NC}"
-                        break
-                    fi
-                done
-                [ -z "$CUDA_HOST_ARGS" ] && echo -e "${YELLOW}   System gcc $_curg > CUDA max $_maxg and no older gcc-N found; CUDA build may fail. Install gcc-$_maxg (e.g. 'gcc15' on Arch).${NC}"
+            if ! command_exists nvcc; then
+                echo -e "${YELLOW}   nvcc not found: NVIDIA driver present but no CUDA toolkit.${NC}"
+                echo -e "${YELLOW}   Install the CUDA toolkit and re-run to get GPU offload for GGUF.${NC}"
+                _llama_cpu_fallback
+            elif ! _llama_cuda_build; then
+                echo -e "${YELLOW}   llama-cpp-python CUDA build failed.${NC}"
+                _llama_cpu_fallback
             fi
-            CMAKE_ARGS="-DGGML_CUDA=on ${CUDA_HOST_ARGS}" \
-                ./myenv/bin/pip install --upgrade --no-cache-dir 'llama-cpp-python>=0.3.0' || \
-                echo -e "${YELLOW}   llama-cpp-python CUDA build failed; GGUF disabled.${NC}"
             ;;
         rocm)
             # Prebuilt manylinux wheels may link libcuda.so.1; AMD boxes have no NVIDIA
@@ -590,10 +704,7 @@ if [ "$INSTALL_LLAMA_CPP" = true ]; then
             ROCM_GFX="$(rocminfo 2>/dev/null | grep -oE 'gfx[0-9a-f]+' | head -1 || true)"
             _rocm_llama_cpu_fallback() {
                 echo -e "${YELLOW}   HIP llama-cpp-python failed; trying CPU-only (GGUF still works)...${NC}"
-                FORCE_CMAKE=1 CMAKE_ARGS="${ROCM_LLAMA_BASE} -DGGML_HIPBLAS=OFF" \
-                    ./myenv/bin/pip install --upgrade --no-cache-dir --no-binary llama-cpp-python \
-                    'llama-cpp-python>=0.3.0' || \
-                    echo -e "${YELLOW}   llama-cpp-python CPU build failed; GGUF disabled.${NC}"
+                _llama_cpu_fallback -DGGML_HIPBLAS=OFF
             }
             if [ -n "$ROCM_GFX" ]; then
                 FORCE_CMAKE=1 CMAKE_ARGS="${ROCM_LLAMA_BASE} -DGGML_HIPBLAS=on -DAMDGPU_TARGETS=${ROCM_GFX} -DCMAKE_C_COMPILER=hipcc -DCMAKE_CXX_COMPILER=hipcc" \
@@ -612,11 +723,13 @@ if [ "$INSTALL_LLAMA_CPP" = true ]; then
             fi
             ;;
         cpu)
-            CMAKE_ARGS="-DGGML_CUDA=OFF" \
+            CMAKE_ARGS="-DGGML_CUDA=OFF ${LLAMA_COMPILER_ARGS}" \
                 ./myenv/bin/pip install --upgrade --no-cache-dir 'llama-cpp-python>=0.3.0' || \
                 echo -e "${YELLOW}   llama-cpp-python CPU build failed; GGUF disabled.${NC}"
             ;;
     esac
+elif [ "$INSTALL_LLAMA_CPP" = true ]; then
+    echo -e "${YELLOW}   Skipping llama-cpp-python: no C/C++ compiler (see [3/7]). GGUF models will not load.${NC}"
 else
     echo -e "${YELLOW}   Skipping llama-cpp-python (--no-llama-cpp). GGUF models will not load.${NC}"
 fi
