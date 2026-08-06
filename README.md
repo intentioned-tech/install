@@ -90,6 +90,106 @@ Check what you have with `python3.12 --version`. A bare `python3` is not
 enough — on rolling-release distributions it tracks the newest interpreter,
 which will not work.
 
+### Installing CUDA (NVIDIA)
+
+Two separate things, and only the first is required:
+
+- the **driver**, which the app needs. The PyTorch wheels the installer pulls
+  bundle their own CUDA runtime, so the driver alone is enough to run everything.
+- the **CUDA toolkit** (`nvcc`), needed only to *compile* `llama-cpp-python`
+  with GPU offload. Without it the installer builds it CPU-only — GGUF models
+  still load, just without the GPU.
+
+`nvidia-smi` comes from the driver, so its presence says nothing about whether
+the toolkit is installed. That is why a machine can pass GPU detection and
+still build GGUF support CPU-only.
+
+**Driver:**
+
+```bash
+sudo ubuntu-drivers install                 # Ubuntu — picks a suitable driver
+sudo apt install -y nvidia-driver-580       # or pin one explicitly
+sudo dnf install -y akmod-nvidia            # Fedora (needs RPM Fusion)
+sudo pacman -S --needed nvidia              # Arch, CachyOS
+```
+
+Reboot afterwards, then run `nvidia-smi`. The installer pulls PyTorch built for
+CUDA 13, which needs **driver 580 or newer** ([release notes][cuda13]); the
+header `nvidia-smi` prints must show `CUDA Version: 13.0` or higher.
+
+**Toolkit** — easiest through the dependency installer:
+
+```bash
+bash install-deps.sh --cuda
+```
+
+or directly:
+
+```bash
+sudo apt install -y nvidia-cuda-toolkit     # Debian, Ubuntu
+sudo dnf install -y cuda-toolkit            # Fedora, RHEL
+sudo pacman -S --needed cuda                # Arch, CachyOS
+```
+
+NVIDIA's own [installer][cuda-dl] is the other route; it puts `nvcc` in
+`/usr/local/cuda/bin` rather than on `PATH`. The installer looks there anyway,
+but for your own shell:
+
+```bash
+export PATH="/usr/local/cuda/bin:$PATH"
+```
+
+Verify with `nvcc --version`. If your distribution's gcc is newer than the
+toolkit accepts, the installer detects it and pins an older `gcc-N` as the CUDA
+host compiler — install one (`gcc15`, `gcc-13`, …) if it reports that none is
+available.
+
+[cuda13]: https://docs.nvidia.com/cuda/archive/13.0.0/cuda-toolkit-release-notes/index.html
+[cuda-dl]: https://developer.nvidia.com/cuda-downloads
+
+### Installing ROCm (AMD)
+
+The installer pulls PyTorch built for **ROCm 7.2**, so install ROCm 7.x. Follow
+AMD's [quick start guide][rocm-qs] for your distribution — the repository
+package is version- and release-specific, so a URL here would go stale. On
+Ubuntu it is roughly:
+
+```bash
+# after installing AMD's amdgpu-install repository package
+sudo apt update
+sudo apt install -y python3-setuptools python3-wheel
+sudo usermod -a -G render,video "$LOGNAME"
+sudo apt install -y rocm
+sudo reboot
+```
+
+The `render` and `video` groups are not optional: the amdgpu device nodes are
+owned by them, and without membership every ROCm call fails with a permission
+error. If `rocminfo` reports `ROCk module is NOT loaded`, that missing group
+membership — or a skipped reboot — is the usual cause.
+
+Verify with:
+
+```bash
+rocm-smi
+rocminfo | grep gfx
+```
+
+The installer reads that `gfx` target itself and passes it to the
+`llama-cpp-python` HIP build as `-DAMDGPU_TARGETS`, falling back to a build
+without a pinned target, then to CPU-only, if HIP fails. It also selects
+`--backend rocm` automatically when `rocminfo` or `rocm-smi` is present, and
+pins 16-bit quantization, which fits the 16 GB cards these commonly are.
+
+If your GPU is not officially supported, ROCm can often still drive it by
+presenting a supported target — for example a gfx1031 card as gfx1030:
+
+```bash
+export HSA_OVERRIDE_GFX_VERSION=10.3.0
+```
+
+[rocm-qs]: https://rocm.docs.amd.com/projects/install-on-linux/en/latest/install/quick-start.html
+
 ## Install
 
 ```bash
