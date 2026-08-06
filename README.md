@@ -26,6 +26,14 @@ curl -fsSL https://raw.githubusercontent.com/intentioned-tech/install/main/insta
 bash install.sh
 ```
 
+`install.sh` installs its own system dependencies. If it cannot (no `sudo`, a
+locked package manager, an unusual distro), install them separately first:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/intentioned-tech/install/main/install-deps.sh -o install-deps.sh
+bash install-deps.sh
+```
+
 You will be prompted for your licence username and password. The password is
 read from a hidden prompt and is never written to disk or passed on the command
 line.
@@ -61,6 +69,65 @@ arguments are visible to every local user through `/proc`.
 
 Environment equivalents: `INTENTIONED_USERNAME`, `INTENTIONED_PASSWORD`,
 `INTENTIONED_WORKER_URL`, `INSTALL_PATH`, `INSTALL_BACKEND`.
+
+## System dependencies (`install-deps.sh`)
+
+Installs the OS packages that cannot come from PyPI:
+
+- a **C/C++ toolchain** — `llama-cpp-python` (GGUF support) publishes no Linux
+  wheels, so pip compiles it from source on every install
+- **Tk**, for every compatible Python found on the machine. `config_tool.py` is
+  a tkinter GUI, and most distros ship tkinter in a separate `-tk` package. A
+  virtualenv inherits the omission from the interpreter it was built on, so
+  this has to be fixed before `myenv` is created — `pip install` cannot.
+- **ffmpeg, git, curl, zstd**, which the installer shells out to
+
+| Flag | Description |
+| --- | --- |
+| `--cuda` | Also install the distro CUDA toolkit (`nvcc`), needed to build llama-cpp-python with GPU offload |
+| `--no-tk` | Skip the Tk packages |
+| `--dry-run` | Print the package-manager commands without running them |
+| `-y`, `--yes` | Do not prompt |
+
+Supports apt, dnf, pacman, zypper and Homebrew. Safe to re-run.
+
+GPU offload for GGUF needs the CUDA **toolkit**, not just the driver —
+`nvidia-smi` comes from the driver, `nvcc` does not. Without `nvcc` the
+installer builds llama-cpp-python CPU-only, which still loads GGUF models.
+
+## Emergency uninstall
+
+Removes everything the installer put on the machine — the application, the
+virtualenv, launchers, desktop entries, systemd units, the sudoers rule, the
+PATH line added to your shell rc, and the model and build caches.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/intentioned-tech/install/main/emergency-uninstall.sh -o emergency-uninstall.sh
+bash emergency-uninstall.sh --dry-run   # print the plan, delete nothing
+bash emergency-uninstall.sh             # then, if it looks right
+```
+
+It prints every path it will delete, with sizes, and requires you to type
+`UNINSTALL` before it touches anything.
+
+| Flag | Description |
+| --- | --- |
+| `--dry-run` | Print the plan and exit |
+| `--install-path PATH` | Install location to remove (default: auto-detected from the launcher symlink) |
+| `--keep-models` | Keep `~/.cache/huggingface` and `~/.cache/torch` |
+| `--keep-cache` | Keep the pip cache too |
+| `--keep-shell-rc` | Do not touch `~/.bashrc` / `~/.zshrc` |
+| `--system-packages` | Also remove the build toolchain, Tk, ffmpeg and the CUDA toolkit |
+| `-y`, `--yes` | Skip the typed confirmation |
+
+**GPU drivers are never removed**, with or without `--system-packages`: driver,
+kernel-module and display-stack packages are filtered out of the removal list.
+`git`, `curl` and your Python installations are left alone for the same reason —
+they predate this app and other tooling depends on them.
+
+`--system-packages` is off by default because those packages are shared with the
+rest of your system. Without it the uninstall is confined to the install path,
+the launchers, and the caches.
 
 ## How licensing works
 

@@ -97,7 +97,7 @@ while [[ $# -gt 0 ]]; do
             echo "                        or \$INTENTIONED_WORKER_URL)"
             echo "  --from-git            MAINTAINERS ONLY: clone the (private) source repo"
             echo "                        licensed build. Maintainers only."
-            echo "  --skip-repo-download  Skip step [5/7] entirely. Use the current directory"
+            echo "  --skip-repo-download  Skip step [5/8] entirely. Use the current directory"
             echo "                        as the repo (or pass --repo-path)."
             echo "  --repo-path PATH      With --skip-repo-download only: use this checkout instead of \$PWD"
             echo "  --no-config           Skip opening config tool after install"
@@ -136,6 +136,12 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
+# Run a command with root privileges. Plain `sudo` fails on the minimal images
+# (containers, cloud base boxes) that run as root without sudo installed.
+_as_root() {
+    if [ "$(id -u)" = 0 ]; then "$@"; else sudo "$@"; fi
+}
+
 detect_backend() {
     case "${INSTALL_BACKEND,,}" in
         auto|"")
@@ -168,7 +174,7 @@ detect_backend() {
 # at time of writing), which sails past a ">= 3.10" test and then produces a
 # venv nothing in this project can use. The failure surfaces much later as an
 # unrelated-looking import error, so check it here instead.
-echo -e "\n${YELLOW}[1/7] Checking Python installation...${NC}"
+echo -e "\n${YELLOW}[1/8] Checking Python installation...${NC}"
 
 is_py312() {
     [ -x "$1" ] || command_exists "$1" || return 1
@@ -215,7 +221,7 @@ fi
 echo -e "${GREEN}   Found: $("$PYTHON_BIN" --version 2>&1) at $PYTHON_BIN ✓${NC}"
 
 # Check for Git
-echo -e "\n${YELLOW}[2/7] Checking Git installation...${NC}"
+echo -e "\n${YELLOW}[2/8] Checking Git installation...${NC}"
 if command_exists git; then
     GIT_VERSION=$(git --version)
     echo -e "${GREEN}   Found: $GIT_VERSION ✓${NC}"
@@ -235,7 +241,7 @@ else
 fi
 
 # Check for ffmpeg
-echo -e "\n${YELLOW}[3/7] Checking ffmpeg and C/C++ build tools...${NC}"
+echo -e "\n${YELLOW}[3/8] Checking system dependencies and C/C++ build tools...${NC}"
 if command_exists ffmpeg; then
     FFMPEG_VERSION=$(ffmpeg -version 2>&1 | head -n1)
     echo -e "${GREEN}   Found: $FFMPEG_VERSION ✓${NC}"
@@ -300,7 +306,6 @@ else
     # Every branch is `|| true`: under `set -e` a missing sudo or a declined
     # password would otherwise abort an install that can still finish without
     # GGUF. A failure here just leaves LLAMA_TOOLCHAIN_OK false.
-    _as_root() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo "$@"; fi; }
     if [ "$PLATFORM" = "Linux" ]; then
         if command_exists apt-get; then
             _as_root apt-get install -y build-essential || true
@@ -329,11 +334,87 @@ else
         else
             echo -e "${YELLOW}       sudo apt-get install -y build-essential${NC}"
         fi
+        echo -e "${YELLOW}   Or install every system dependency at once:${NC}"
+        echo -e "${YELLOW}       bash install-deps.sh${NC}"
     fi
 fi
 
+# Check for Tk (tkinter)
+#
+# config_tool.py is a tkinter GUI, and tkinter is the one stdlib module distros
+# routinely omit: it lives in a separate `-tk` package. A venv inherits the
+# omission from the interpreter it was built on, so `pip install` cannot fix it
+# afterwards — the package has to be there before myenv is created.
+#
+# Every detected interpreter is covered, not just the 3.12 this install will
+# use. Which one config_tool.py ends up running under depends on the venv, on
+# $INTENTIONED_PYTHON and on whatever the operator upgrades to next, and the
+# packages are a few hundred KB each.
+TK_MIN_MINOR=9
+TK_MAX_MINOR=14
+
+# tkinter's package name, most specific first. Debian/Fedora/SUSE split it per
+# interpreter; Arch shares one system-wide `tk` that its `python` links against.
+tk_packages_for() {
+    local py="$1" nodot="${1//./}"
+    if command_exists apt-get;   then echo "python${py}-tk python3-tk"
+    elif command_exists dnf;     then echo "python${py}-tkinter python3-tkinter"
+    elif command_exists pacman;  then echo "tk"
+    elif command_exists zypper;  then echo "python${nodot}-tk python3-tk"
+    elif [ "$PLATFORM" = "macOS" ]; then echo "python-tk@${py} python-tk"
+    fi
+}
+
+install_tk_package() {
+    local pkg
+    for pkg in $(tk_packages_for "$1"); do
+        if [ "$PLATFORM" = "macOS" ]; then
+            brew install "$pkg" >/dev/null 2>&1 && return 0
+        elif command_exists apt-get; then
+            _as_root apt-get install -y "$pkg" >/dev/null 2>&1 && return 0
+        elif command_exists dnf; then
+            _as_root dnf install -y "$pkg" >/dev/null 2>&1 && return 0
+        elif command_exists pacman; then
+            _as_root pacman -S --needed --noconfirm "$pkg" >/dev/null 2>&1 && return 0
+        elif command_exists zypper; then
+            _as_root zypper --non-interactive install -y "$pkg" >/dev/null 2>&1 && return 0
+        fi
+    done
+    return 1
+}
+
+# `import tkinter` alone is NOT a valid test. The pure-Python half of tkinter
+# ships in the base stdlib, and removing the -tk package leaves the now-empty
+# /usr/lib/pythonX.Y/tkinter/ directory behind — which Python then imports
+# happily as a namespace package, __file__ = None and no Tk in sight. Import
+# the C extension too, and touch an attribute that only the real __init__.py
+# defines. Tk() is deliberately NOT constructed: that needs a display.
+TK_PROBE='import tkinter, _tkinter; tkinter.Tk'
+
+TK_MISSING=""
+for _v in $(seq "$TK_MAX_MINOR" -1 "$TK_MIN_MINOR"); do
+    _py="python3.$_v"
+    command_exists "$_py" || continue
+    if "$_py" -c "$TK_PROBE" >/dev/null 2>&1; then
+        echo -e "${GREEN}   $_py: tkinter ✓${NC}"
+        continue
+    fi
+    echo -e "${YELLOW}   $_py: tkinter missing, installing...${NC}"
+    install_tk_package "3.$_v" || true
+    if "$_py" -c "$TK_PROBE" >/dev/null 2>&1; then
+        echo -e "${GREEN}   $_py: tkinter ✓${NC}"
+    else
+        echo -e "${YELLOW}   $_py: tkinter still missing${NC}"
+        TK_MISSING="$TK_MISSING $_py"
+    fi
+done
+if [ -n "$TK_MISSING" ]; then
+    echo -e "${YELLOW}   Configuration tool needs tkinter; missing for:${TK_MISSING}${NC}"
+    echo -e "${YELLOW}   Install it, then re-run:  bash install-deps.sh${NC}"
+fi
+
 # Create installation directory
-echo -e "\n${YELLOW}[4/7] Creating installation directory...${NC}"
+echo -e "\n${YELLOW}[4/8] Creating installation directory...${NC}"
 mkdir -p "$INSTALL_PATH"
 echo -e "${GREEN}   Path: $INSTALL_PATH ✓${NC}"
 
@@ -344,7 +425,7 @@ if [ "$SKIP_REPO_DOWNLOAD" = true ]; then
     else
         REPO_PATH="$(pwd -P)"
     fi
-    echo -e "\n${YELLOW}[5/7] Skipping repository download (--skip-repo-download)${NC}"
+    echo -e "\n${YELLOW}[5/8] Skipping repository download (--skip-repo-download)${NC}"
     if [ ! -f "$REPO_PATH/requirements.txt" ]; then
         echo -e "${RED}   No project checkout at:${NC}"
         echo -e "${RED}   $REPO_PATH${NC}" >&2
@@ -361,7 +442,7 @@ elif [ "$SOURCE_MODE" = "git" ]; then
         exit 1
     fi
     REPO_PATH="$INSTALL_PATH/intentioned.tech"
-    echo -e "\n${YELLOW}[5/7] Cloning source (--from-git)...${NC}"
+    echo -e "\n${YELLOW}[5/8] Cloning source (--from-git)...${NC}"
     # MAINTAINERS ONLY. The source repo is private, so this path fails with an
     # authentication error for anyone without access — which is intended. It is
     # not a customer install route; customers use release mode (the default).
@@ -391,7 +472,7 @@ else
         exit 1
     fi
     REPO_PATH="$INSTALL_PATH/intentioned.tech"
-    echo -e "\n${YELLOW}[5/7] Downloading your licensed build...${NC}"
+    echo -e "\n${YELLOW}[5/8] Downloading your licensed build...${NC}"
 
     command_exists curl || { echo -e "${RED}   curl is required to download the release.${NC}" >&2; exit 1; }
     if ! command_exists zstd && ! tar --help 2>/dev/null | grep -q zstd; then
@@ -442,7 +523,7 @@ else
         exit 1
     fi
 
-    # Parse with the interpreter already located in [1/7] rather than adding a
+    # Parse with the interpreter already located in [1/8] rather than adding a
     # jq dependency for three fields.
     REL_VERSION="$("$PYTHON_BIN" -c 'import json,sys;print(json.load(open(sys.argv[1])).get("version") or "")' "$DL_WORK/check.json")"
     REL_SHA256="$("$PYTHON_BIN" -c 'import json,sys;print(json.load(open(sys.argv[1])).get("sha256") or "")' "$DL_WORK/check.json")"
@@ -543,7 +624,7 @@ PY
 fi
 
 # Create virtual environment and install dependencies
-echo -e "\n${YELLOW}[6/7] Installing Python dependencies...${NC}"
+echo -e "\n${YELLOW}[6/8] Installing Python dependencies...${NC}"
 cd "$REPO_PATH"
 # Test the interpreter, not the directory. `[ ! -d myenv ]` alone treats a venv
 # whose interpreter has vanished as usable, and every later ./myenv/bin/pip call
@@ -629,7 +710,7 @@ fi
 if [ "$INSTALL_LLAMA_CPP" = true ] && [ "$LLAMA_TOOLCHAIN_OK" = true ]; then
     echo -e "${YELLOW}   Building llama-cpp-python for ${SELECTED_BACKEND} (GGUF support)...${NC}"
 
-    # Pin the toolchain resolved in [3/7] two ways: exported, so scikit-build-core
+    # Pin the toolchain resolved in [3/8] two ways: exported, so scikit-build-core
     # leaves its sysconfig CC/CXX defaults alone, and as cache variables, so an
     # inherited CC/CXX from the caller's shell cannot win either.
     export CC="$CC_BIN"
@@ -729,7 +810,7 @@ if [ "$INSTALL_LLAMA_CPP" = true ] && [ "$LLAMA_TOOLCHAIN_OK" = true ]; then
             ;;
     esac
 elif [ "$INSTALL_LLAMA_CPP" = true ]; then
-    echo -e "${YELLOW}   Skipping llama-cpp-python: no C/C++ compiler (see [3/7]). GGUF models will not load.${NC}"
+    echo -e "${YELLOW}   Skipping llama-cpp-python: no C/C++ compiler (see [3/8]). GGUF models will not load.${NC}"
 else
     echo -e "${YELLOW}   Skipping llama-cpp-python (--no-llama-cpp). GGUF models will not load.${NC}"
 fi
