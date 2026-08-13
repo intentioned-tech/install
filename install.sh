@@ -1082,6 +1082,7 @@ CURRENT_USER=$(whoami)
 SUDOERS_FILE="/etc/sudoers.d/intentioned-restart"
 UNIT_MANIFEST="$INSTALL_PATH/.installed_units"
 SERVICE_INSTALLED=false
+SERVICE_NAME_DEFAULT="intentioned-server.service"
 INSTALLED_UNITS=""
 INSTALLED_SERVICES=""
 ONESHOT_UNITS=""
@@ -1103,16 +1104,59 @@ else
     # Found rather than named, so a release that adds or renames a unit needs no
     # change here. myenv is pruned: a virtualenv can contain unit files belonging
     # to unrelated packages.
-    DIST_UNITS="$(find "$SERVER_DIR" -maxdepth 3 \
+    DIST_UNITS="$(find "$SERVER_DIR" -maxdepth 6 \
         \( -type d -name myenv -prune \) -o \
         \( -type f \( -name '*.service' -o -name '*.timer' \) -print \) 2>/dev/null | sort)"
 
+    GENERATED_UNIT_DIR=""
     if [ -z "$DIST_UNITS" ]; then
-        echo -e "${RED}   No .service or .timer files found under ${SERVER_DIR}.${NC}"
-        echo -e "${YELLOW}   This release ships none, or the install is incomplete.${NC}"
-        echo -e "${YELLOW}   The 'intentioned' launcher still runs the app in the foreground.${NC}"
-    else
-        echo -e "${YELLOW}   Found $(printf '%s\n' "$DIST_UNITS" | wc -l) unit file(s) in the release.${NC}"
+        # No units in the release. Generate one for the server so the app still
+        # runs as a daemon — leaving the machine with no service at all is the
+        # worse outcome. Anything the release ships beyond the server (an
+        # updater and its timer) cannot be reconstructed here and is not
+        # attempted; run the app's own updater by hand if you need it.
+        echo -e "${YELLOW}   No .service or .timer files found under ${SERVER_DIR}.${NC}"
+        echo -e "${YELLOW}   Generating ${SERVICE_NAME_DEFAULT} for the server instead.${NC}"
+
+        # GPU device nodes (/dev/nvidia*, /dev/kfd, /dev/dri/renderD*) are owned
+        # by the video/render groups. A user added to those groups mid-session
+        # does not see it in their current login shell until they log out and
+        # back in, but a service's SupplementaryGroups= is resolved fresh at
+        # start time. Only groups that exist are named: a missing one fails the
+        # whole service to start.
+        SERVICE_GROUPS=""
+        if [ "$SELECTED_BACKEND" = "rocm" ]; then
+            for _g in render video; do
+                getent group "$_g" >/dev/null 2>&1 && SERVICE_GROUPS="$SERVICE_GROUPS $_g"
+            done
+        fi
+
+        GENERATED_UNIT_DIR="$(mktemp -d)"
+        {
+            echo "[Unit]"
+            echo "Description=Intentioned.tech voice coaching server"
+            echo "After=network.target"
+            echo ""
+            echo "[Service]"
+            echo "Type=simple"
+            echo "User=${CURRENT_USER}"
+            [ -n "$SERVICE_GROUPS" ] && echo "SupplementaryGroups=${SERVICE_GROUPS# }"
+            echo "WorkingDirectory=${SERVER_DIR}"
+            echo "Environment=HOME=${HOME}"
+            echo "ExecStart=${REPO_PATH}/myenv/bin/python ${SERVER_DIR}/${SERVER_ENTRY}"
+            echo "Restart=on-failure"
+            echo "RestartSec=5"
+            echo ""
+            echo "[Install]"
+            echo "WantedBy=multi-user.target"
+        } > "${GENERATED_UNIT_DIR}/${SERVICE_NAME_DEFAULT}"
+        DIST_UNITS="${GENERATED_UNIT_DIR}/${SERVICE_NAME_DEFAULT}"
+    fi
+
+    if [ -n "$DIST_UNITS" ]; then
+        if [ -z "$GENERATED_UNIT_DIR" ]; then
+            echo -e "${YELLOW}   Found $(printf '%s\n' "$DIST_UNITS" | wc -l) unit file(s) in the release.${NC}"
+        fi
 
         # Units are packaged with placeholders for anything only the installing
         # machine knows. Substituted only where present, so a unit shipping
@@ -1223,6 +1267,7 @@ else
             echo -e "${YELLOW}   Use the 'intentioned' launcher, or re-run with --no-systemd-service.${NC}"
         fi
     fi
+    [ -n "$GENERATED_UNIT_DIR" ] && rm -rf "$GENERATED_UNIT_DIR"
 
     # The app's config tool restarts the server after a settings change, so the
     # rule covers every long-running service that was actually installed —
