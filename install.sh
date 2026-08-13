@@ -1101,12 +1101,39 @@ else
     # the build and change with it, so a unit written by this script would drift
     # from whatever the release actually expects.
     #
-    # Found rather than named, so a release that adds or renames a unit needs no
-    # change here. myenv is pruned: a virtualenv can contain unit files belonging
-    # to unrelated packages.
-    DIST_UNITS="$(find "$SERVER_DIR" -maxdepth 6 \
-        \( -type d -name myenv -prune \) -o \
-        \( -type f \( -name '*.service' -o -name '*.timer' \) -print \) 2>/dev/null | sort)"
+    # systemd/ beside the app is where the release puts them. Checked by name
+    # first so the common case does not depend on the recursive search below
+    # behaving, and so the searched locations can be named when nothing is
+    # found. The sibling form covers a layout where the app directory and the
+    # systemd directory sit next to each other rather than one inside the other.
+    UNIT_SEARCH_DIRS=""
+    for _ud in "$SERVER_DIR/systemd" "$INSTALL_PATH/systemd" "$(dirname "$INSTALL_PATH")/intentioned/systemd"; do
+        case " $UNIT_SEARCH_DIRS " in
+            *" $_ud "*) ;;
+            *) UNIT_SEARCH_DIRS="$UNIT_SEARCH_DIRS $_ud" ;;
+        esac
+    done
+    DIST_UNITS=""
+    for _ud in $UNIT_SEARCH_DIRS; do
+        [ -d "$_ud" ] || continue
+        for _uf in "$_ud"/*.service "$_ud"/*.timer; do
+            [ -f "$_uf" ] || continue
+            case " $DIST_UNITS " in
+                *" $_uf "*) ;;
+                *) DIST_UNITS="$DIST_UNITS $_uf" ;;
+            esac
+        done
+    done
+    DIST_UNITS="$(printf '%s\n' $DIST_UNITS | sort)"
+
+    # Anywhere else under the install tree, for a release that moves them.
+    # myenv is pruned: a virtualenv can contain unit files belonging to
+    # unrelated packages.
+    if [ -z "$DIST_UNITS" ]; then
+        DIST_UNITS="$(find "$SERVER_DIR" -maxdepth 6 \
+            \( -type d -name myenv -prune \) -o \
+            \( -type f \( -name '*.service' -o -name '*.timer' \) -print \) 2>/dev/null | sort)"
+    fi
 
     GENERATED_UNIT_DIR=""
     if [ -z "$DIST_UNITS" ]; then
@@ -1115,8 +1142,17 @@ else
         # worse outcome. Anything the release ships beyond the server (an
         # updater and its timer) cannot be reconstructed here and is not
         # attempted; run the app's own updater by hand if you need it.
-        echo -e "${YELLOW}   No .service or .timer files found under ${SERVER_DIR}.${NC}"
-        echo -e "${YELLOW}   Generating ${SERVICE_NAME_DEFAULT} for the server instead.${NC}"
+        echo -e "${RED}   No .service or .timer files found. Looked in:${NC}"
+        for _ud in $UNIT_SEARCH_DIRS; do
+            if [ -d "$_ud" ]; then
+                echo -e "${YELLOW}      $_ud (exists, but holds no unit files)${NC}"
+            else
+                echo -e "${YELLOW}      $_ud (does not exist)${NC}"
+            fi
+        done
+        echo -e "${YELLOW}      and recursively under $SERVER_DIR${NC}"
+        echo -e "${YELLOW}   Generating ${SERVICE_NAME_DEFAULT} for the server instead —${NC}"
+        echo -e "${YELLOW}   the updater and its timer cannot be reconstructed here.${NC}"
 
         # GPU device nodes (/dev/nvidia*, /dev/kfd, /dev/dri/renderD*) are owned
         # by the video/render groups. A user added to those groups mid-session
