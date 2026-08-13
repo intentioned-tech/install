@@ -1291,7 +1291,14 @@ else
                 # the placeholder in place lets the check below report it, rather
                 # than substituting nothing and installing a broken unit.
                 [ -n "$_v" ] || continue
-                sed -i -e "s#__${_k}__#${_v}#g" \
+                # Doubled delimiters first. @@VAR@@ is what these templates
+                # use, and matching the single form against it consumes only
+                # the inner pair — leaving User=@administrator@ and
+                # WorkingDirectory=@/home/...@, which systemd rejects as a
+                # non-absolute path and a malformed user name.
+                sed -i -e "s#@@${_k}@@#${_v}#g" \
+                       -e "s#%%${_k}%%#${_v}#g" \
+                       -e "s#__${_k}__#${_v}#g" \
                        -e "s#@${_k}@#${_v}#g" \
                        -e "s#{{[[:space:]]*${_k}[[:space:]]*}}#${_v}#g" \
                        -e "s#%${_k}%#${_v}#g" "$_tmp"
