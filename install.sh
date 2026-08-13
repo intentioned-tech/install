@@ -1059,6 +1059,55 @@ PY
 fi
 echo -e "${GREEN}   Dependencies installed ✓${NC}"
 
+# Locate the server entry point
+#
+# Hardcoding a filename here is what produced a restart-looping service with
+# "can't open file '.../server.py': [Errno 2] No such file or directory": the
+# entry point is run_server.py, not server.py. Resolve it once, from what is
+# actually on disk, and drive the unit file and both launchers off the result —
+# a rename in a future release then costs one entry in this list rather than
+# three silently wrong paths.
+#
+# The subdirectory sweep covers a release whose tree does not sit flat in
+# $INSTALL_PATH. Only one level deep, and myenv is skipped: the venv contains
+# unrelated scripts that must never be mistaken for the app's own.
+SERVER_ENTRY=""
+SERVER_DIR=""
+for _cand in run_server.py server.py main.py app.py; do
+    if [ -f "$INSTALL_PATH/$_cand" ]; then
+        SERVER_ENTRY="$_cand"
+        SERVER_DIR="$INSTALL_PATH"
+        break
+    fi
+done
+if [ -z "$SERVER_ENTRY" ]; then
+    for _sub in "$INSTALL_PATH"/*/; do
+        [ -d "$_sub" ] || continue
+        case "${_sub%/}" in */myenv) continue ;; esac
+        for _cand in run_server.py server.py main.py app.py; do
+            if [ -f "${_sub}${_cand}" ]; then
+                SERVER_ENTRY="$_cand"
+                SERVER_DIR="${_sub%/}"
+                break 2
+            fi
+        done
+    done
+fi
+if [ -n "$SERVER_ENTRY" ]; then
+    if [ "$SERVER_DIR" != "$INSTALL_PATH" ]; then
+        echo -e "${YELLOW}   Server entry point found in ${SERVER_DIR} (not the install root).${NC}"
+    fi
+    echo -e "${GREEN}   Entry point: ${SERVER_DIR}/${SERVER_ENTRY} ✓${NC}"
+else
+    # Fall back to the documented layout so the launchers still get written;
+    # they will report the missing file themselves when run.
+    SERVER_ENTRY="run_server.py"
+    SERVER_DIR="$INSTALL_PATH"
+    echo -e "${RED}   No server entry point found under ${INSTALL_PATH}.${NC}"
+    echo -e "${YELLOW}   Expected run_server.py. The install may be incomplete —${NC}"
+    echo -e "${YELLOW}   launchers and the service will point at ${SERVER_DIR}/${SERVER_ENTRY}.${NC}"
+fi
+
 # Setup the systemd service, and passwordless sudo to restart it
 echo -e "\n${YELLOW}[7/8] Setting up the systemd service...${NC}"
 CURRENT_USER=$(whoami)
@@ -1104,9 +1153,9 @@ else
         echo "Type=simple"
         echo "User=${CURRENT_USER}"
         [ -n "$SERVICE_GROUPS" ] && echo "SupplementaryGroups=${SERVICE_GROUPS# }"
-        echo "WorkingDirectory=${INSTALL_PATH}"
+        echo "WorkingDirectory=${SERVER_DIR}"
         echo "Environment=HOME=${HOME}"
-        echo "ExecStart=${INSTALL_PATH}/myenv/bin/python ${INSTALL_PATH}/server.py"
+        echo "ExecStart=${REPO_PATH}/myenv/bin/python ${SERVER_DIR}/${SERVER_ENTRY}"
         echo "Restart=on-failure"
         echo "RestartSec=5"
         echo ""
@@ -1196,18 +1245,21 @@ mkdir -p "$USER_BIN"
 # Replaces the symlink earlier versions created here.
 rm -f "$USER_BIN/intentioned" "$USER_BIN/intentioned-config"
 
+# The venv lives at the install root even when the app itself sits a level
+# down, so activate by absolute path rather than relative to the working
+# directory.
 cat > "$USER_BIN/intentioned" << EOF
 #!/bin/bash
-cd "$REPO_PATH"
-source myenv/bin/activate
-python server.py
+cd "$SERVER_DIR"
+source "$REPO_PATH/myenv/bin/activate"
+python "$SERVER_ENTRY"
 EOF
 chmod +x "$USER_BIN/intentioned"
 
 cat > "$USER_BIN/intentioned-config" << EOF
 #!/bin/bash
-cd "$REPO_PATH"
-source myenv/bin/activate
+cd "$SERVER_DIR"
+source "$REPO_PATH/myenv/bin/activate"
 python config_tool.py
 EOF
 chmod +x "$USER_BIN/intentioned-config"
@@ -1235,7 +1287,7 @@ Type=Application
 Name=Intentioned.tech
 Comment=Social Skills Training Platform
 Exec=$USER_BIN/intentioned
-Icon=$REPO_PATH/favicon.ico
+Icon=$SERVER_DIR/favicon.ico
 Terminal=true
 Categories=Education;
 EOF
@@ -1247,7 +1299,7 @@ Type=Application
 Name=Intentioned.tech Config
 Comment=Intentioned.tech Configuration Tool
 Exec=$USER_BIN/intentioned-config
-Icon=$REPO_PATH/favicon.ico
+Icon=$SERVER_DIR/favicon.ico
 Terminal=false
 Categories=Education;Settings;
 EOF
@@ -1288,8 +1340,8 @@ if [ "$OPEN_CONFIG" = true ]; then
     read -r response
     if [[ ! "$response" =~ ^[Nn]$ ]]; then
         echo -e "${CYAN}Opening Configuration Tool...${NC}"
-        cd "$REPO_PATH"
-        source myenv/bin/activate
+        cd "$SERVER_DIR"
+        source "$REPO_PATH/myenv/bin/activate"
         python config_tool.py
     fi
 fi
