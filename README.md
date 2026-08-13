@@ -248,10 +248,40 @@ rebuilt, so nothing is re-downloaded.
 | `--worker-url URL` | Licence server (default: the hosted Worker) |
 | `--no-config` | Skip opening the configuration tool afterwards |
 | `--skip-repo-download` | Use an existing local checkout or dist |
+| `--no-systemd-service` | Do not install/enable the background `intentioned-server` service |
 | `--help` | Full option list |
 
 Environment equivalents: `INTENTIONED_USERNAME`, `INTENTIONED_PASSWORD`,
 `INTENTIONED_WORKER_URL`, `INSTALL_PATH`, `INSTALL_BACKEND`.
+
+### Running as a service
+
+On Linux, the installer sets up `intentioned-server.service` — a systemd unit
+that runs the app as a background daemon, enabled to start at boot:
+
+```bash
+systemctl status intentioned-server.service
+journalctl -u intentioned-server.service -f
+sudo systemctl restart intentioned-server.service   # no password needed
+```
+
+That last one works passwordless by design: the installer also writes
+`/etc/sudoers.d/intentioned-restart`, scoped to exactly that one command for
+the installing user, so the app's own config tool can restart the service
+after a settings change without prompting.
+
+The `intentioned` launcher in `~/.local/bin` still runs a separate, **foreground**
+copy — useful for watching logs directly or one-off runs, but don't run it
+while the service is also up: two copies competing for the same port and GPU
+memory is not a supported configuration. `sudo systemctl stop
+intentioned-server.service` first.
+
+Skip all of this with `--no-systemd-service` (always skipped on macOS, which
+has no systemd) — the foreground launcher is created either way and is the
+only way to run the app if you skip the service.
+
+`emergency-uninstall.sh` already discovers and removes any `intentioned*`
+systemd unit and the sudoers rule automatically; no separate cleanup is needed.
 
 ## System dependencies (`install-deps.sh`)
 

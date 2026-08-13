@@ -16,6 +16,7 @@ INSTALL_PATH="${INSTALL_PATH:-$HOME/.local/share/intentioned}"
 OPEN_CONFIG=true
 INSTALL_BACKEND="${INSTALL_BACKEND:-auto}"
 INSTALL_LLAMA_CPP=true
+INSTALL_SYSTEMD_SERVICE=true
 GGUF_MODEL=""
 SKIP_REPO_DOWNLOAD=false
 REPO_PATH_CLI=""
@@ -78,6 +79,10 @@ while [[ $# -gt 0 ]]; do
             INSTALL_LLAMA_CPP=false
             shift
             ;;
+        --no-systemd-service)
+            INSTALL_SYSTEMD_SERVICE=false
+            shift
+            ;;
         --gguf)
             GGUF_MODEL="$2"
             shift 2
@@ -102,6 +107,10 @@ while [[ $# -gt 0 ]]; do
             echo "  --repo-path PATH      With --skip-repo-download only: use this checkout instead of \$PWD"
             echo "  --no-config           Skip opening config tool after install"
             echo "  --no-llama-cpp        Skip building llama-cpp-python (GGUF support)"
+            echo "  --no-systemd-service  Do not install/enable the intentioned-server systemd"
+            echo "                        service. The 'intentioned' foreground launcher is"
+            echo "                        created either way; this only skips the background"
+            echo "                        daemon. Always skipped on macOS (no systemd)."
             echo "  --gguf REPO[:FILE]    Configure a GGUF model as the LLM"
             echo "                        e.g. bartowski/Qwen2.5-3B-Instruct-GGUF:*Q4_K_M*.gguf"
             echo "                        or /abs/path/to/file.gguf"
@@ -1050,37 +1059,120 @@ PY
 fi
 echo -e "${GREEN}   Dependencies installed ✓${NC}"
 
-# Setup passwordless sudo for service restart
-echo -e "\n${YELLOW}[7/8] Setting up passwordless sudo for service restart...${NC}"
+# Setup the systemd service, and passwordless sudo to restart it
+echo -e "\n${YELLOW}[7/8] Setting up the systemd service...${NC}"
 CURRENT_USER=$(whoami)
 SUDOERS_FILE="/etc/sudoers.d/intentioned-restart"
+SERVICE_NAME="intentioned-server.service"
+SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
+SERVICE_INSTALLED=false
 
-if [ "$PLATFORM" = "Linux" ]; then
+if [ "$PLATFORM" != "Linux" ]; then
+    echo -e "${YELLOW}   Skipping systemd service and sudoers setup (not supported on ${PLATFORM}).${NC}"
+    echo -e "${YELLOW}   Use the 'intentioned' launcher to run the app in the foreground.${NC}"
+elif [ "$INSTALL_SYSTEMD_SERVICE" != true ]; then
+    echo -e "${YELLOW}   Skipping (--no-systemd-service). Use the 'intentioned' launcher instead.${NC}"
+elif ! command_exists systemctl; then
+    echo -e "${YELLOW}   No systemd on this system; skipping. Use the 'intentioned' launcher instead.${NC}"
+else
+    # GPU device nodes (/dev/nvidia*, /dev/kfd, /dev/dri/renderD*) are owned by
+    # the video/render groups. A user added to those groups mid-session (e.g. by
+    # the ROCm install steps above) does not see the membership in their current
+    # login shell until they log out and back in — but a system service's
+    # SupplementaryGroups= is resolved fresh from /etc/group at service-start
+    # time, so setting it here sidesteps that relogin requirement entirely for
+    # the service specifically. Only added when the groups actually exist:
+    # naming a nonexistent group in a unit file fails the whole service to start.
+    SERVICE_GROUPS=""
+    if [ "$SELECTED_BACKEND" = "rocm" ]; then
+        for _g in render video; do
+            getent group "$_g" >/dev/null 2>&1 && SERVICE_GROUPS="$SERVICE_GROUPS $_g"
+        done
+    fi
+
+    echo -e "${YELLOW}   Writing ${SERVICE_NAME} for ${CURRENT_USER}...${NC}"
+    # --suffix matters, not just cosmetic: systemd-analyze verify refuses a
+    # bare mktemp filename ("Failed to prepare filename ...: Invalid
+    # argument") — it requires something it can resolve as a unit name.
+    TEMP_SERVICE=$(mktemp --suffix=.service)
+    {
+        echo "[Unit]"
+        echo "Description=Intentioned.tech voice coaching server"
+        echo "After=network.target"
+        echo ""
+        echo "[Service]"
+        echo "Type=simple"
+        echo "User=${CURRENT_USER}"
+        [ -n "$SERVICE_GROUPS" ] && echo "SupplementaryGroups=${SERVICE_GROUPS# }"
+        echo "WorkingDirectory=${INSTALL_PATH}"
+        echo "Environment=HOME=${HOME}"
+        echo "ExecStart=${INSTALL_PATH}/myenv/bin/python ${INSTALL_PATH}/server.py"
+        echo "Restart=on-failure"
+        echo "RestartSec=5"
+        echo ""
+        echo "[Install]"
+        echo "WantedBy=multi-user.target"
+    } > "$TEMP_SERVICE"
+
+    # Best-effort: not every system has systemd-analyze (e.g. minimal containers
+    # running systemd itself but not the full package), and a missing validator
+    # should not block an otherwise-correct install.
+    SERVICE_VALID=true
+    if command_exists systemd-analyze; then
+        systemd-analyze verify "$TEMP_SERVICE" 2>/dev/null || SERVICE_VALID=false
+    fi
+
+    if [ "$SERVICE_VALID" != true ]; then
+        echo -e "${RED}   Generated unit file failed validation; skipping systemd setup.${NC}"
+        echo -e "${YELLOW}   Inspect it: systemd-analyze verify ${TEMP_SERVICE}${NC}"
+    # Every step from here on can fail for a reason that has nothing to do with
+    # this install being broken — most commonly, no systemd bus to talk to
+    # (containers, WSL, chroots). That must not take the rest of install.sh
+    # down with it under `set -e`, so the install+reload pair is the `if`
+    # condition itself rather than bare statements.
+    elif sudo install -o root -g root -m 0644 "$TEMP_SERVICE" "$SERVICE_FILE" && sudo systemctl daemon-reload; then
+        sudo systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
+        # restart, not start: idempotent on re-installs where paths or the venv
+        # changed since the service was last started.
+        if sudo systemctl restart "$SERVICE_NAME"; then
+            sleep 1
+            if sudo systemctl is-active --quiet "$SERVICE_NAME"; then
+                echo -e "${GREEN}   ${SERVICE_NAME} installed, enabled, and running ✓${NC}"
+                SERVICE_INSTALLED=true
+            else
+                echo -e "${YELLOW}   ${SERVICE_NAME} installed but exited after starting.${NC}"
+                echo -e "${YELLOW}   Check config.json, then: journalctl -u ${SERVICE_NAME} -n 50${NC}"
+                SERVICE_INSTALLED=true
+            fi
+        else
+            echo -e "${RED}   Failed to start ${SERVICE_NAME}.${NC}"
+            echo -e "${YELLOW}   Check: journalctl -u ${SERVICE_NAME} -n 50${NC}"
+        fi
+    else
+        echo -e "${RED}   Could not install the systemd unit (no systemd bus reachable?).${NC}"
+        echo -e "${YELLOW}   Use the 'intentioned' launcher instead, or re-run with --no-systemd-service.${NC}"
+    fi
+    rm -f "$TEMP_SERVICE"
+
     echo -e "${YELLOW}   Creating sudoers rule for ${CURRENT_USER}...${NC}"
-    
-    # Create temporary sudoers file
     TEMP_SUDOERS=$(mktemp)
-    echo "${CURRENT_USER} ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart intentioned-server.service" > "$TEMP_SUDOERS"
-    
-    # Validate syntax before installing
+    echo "${CURRENT_USER} ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart ${SERVICE_NAME}" > "$TEMP_SUDOERS"
+
     if sudo visudo -cf "$TEMP_SUDOERS" > /dev/null 2>&1; then
         sudo install -o root -g root -m 0440 "$TEMP_SUDOERS" "$SUDOERS_FILE"
         echo -e "${GREEN}   Sudoers rule installed ✓${NC}"
-        
-        # Test the configuration
-        if sudo -n systemctl status intentioned-server.service > /dev/null 2>&1; then
+
+        if [ "$SERVICE_INSTALLED" = true ] && sudo -n systemctl status "$SERVICE_NAME" > /dev/null 2>&1; then
             echo -e "${GREEN}   Passwordless sudo verified ✓${NC}"
         else
-            echo -e "${YELLOW}   Sudoers rule installed but service not yet running${NC}"
+            echo -e "${YELLOW}   Sudoers rule installed but service not running to verify against${NC}"
         fi
     else
         echo -e "${RED}   Sudoers syntax validation failed${NC}"
         echo -e "${YELLOW}   You may need to manually configure sudoers${NC}"
     fi
-    
+
     rm -f "$TEMP_SUDOERS"
-else
-    echo -e "${YELLOW}   Skipping sudoers setup (not supported on ${PLATFORM})${NC}"
 fi
 
 # Apply NeMo CUDA graph patches (fixes cu_call unpacking bug)
@@ -1178,6 +1270,17 @@ echo "║                                                                ║"
 echo "║  Installation path: $INSTALL_PATH                              "
 echo "╚═══════════════════════════════════════════════════════════════╝"
 echo -e "${NC}"
+
+if [ "$SERVICE_INSTALLED" = true ]; then
+    echo -e "${CYAN}Running in the background as ${SERVICE_NAME}:${NC}"
+    echo -e "${CYAN}    systemctl status ${SERVICE_NAME}${NC}"
+    echo -e "${CYAN}    journalctl -u ${SERVICE_NAME} -f${NC}"
+    echo -e "${CYAN}    sudo systemctl restart ${SERVICE_NAME}   (no password needed)${NC}"
+    echo -e "${CYAN}The 'intentioned' launcher above runs a separate foreground copy —${NC}"
+    echo -e "${CYAN}stop the service first (sudo systemctl stop ${SERVICE_NAME}) to avoid${NC}"
+    echo -e "${CYAN}two instances competing for the same port and GPU.${NC}"
+    echo ""
+fi
 
 # Offer to open config tool
 if [ "$OPEN_CONFIG" = true ]; then
