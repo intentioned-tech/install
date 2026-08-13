@@ -104,14 +104,31 @@ Two separate things, and only the first is required:
 the toolkit is installed. That is why a machine can pass GPU detection and
 still build GGUF support CPU-only.
 
-**Driver:**
+**Driver — run ONE of these, not more than one:**
 
 ```bash
-sudo ubuntu-drivers install                 # Ubuntu — picks a suitable driver
-sudo apt install -y nvidia-driver-580       # or pin one explicitly
-sudo dnf install -y akmod-nvidia            # Fedora (needs RPM Fusion)
-sudo pacman -S --needed nvidia              # Arch, CachyOS
+sudo ubuntu-drivers install            # Ubuntu — picks a suitable driver
 ```
+
+```bash
+sudo apt install -y nvidia-driver-580  # Ubuntu — or pin a version instead of the line above
+```
+
+```bash
+sudo dnf install -y akmod-nvidia       # Fedora (needs RPM Fusion)
+```
+
+```bash
+sudo pacman -S --needed nvidia         # Arch, CachyOS
+```
+
+Running both Ubuntu lines back to back is the single most common way this goes
+wrong: `ubuntu-drivers install` resolves and installs one driver version,
+`apt install nvidia-driver-580` then installs another on top, and the machine
+ends up with two conflicting driver packages fighting over the same kernel
+module. GDM fails to start and you land with no GUI. If that already happened
+to you, see [**No GUI after installing the driver**](#no-gui-after-installing-the-driver)
+below before doing anything else.
 
 Reboot afterwards, then run `nvidia-smi`. The installer pulls PyTorch built for
 CUDA 13, which needs **driver 580 or newer** ([release notes][cuda13]); the
@@ -153,6 +170,56 @@ available.
 
 [cuda13]: https://docs.nvidia.com/cuda/archive/13.0.0/cuda-toolkit-release-notes/index.html
 [cuda-dl]: https://developer.nvidia.com/cuda-downloads
+
+#### No GUI after installing the driver
+
+Usually caused by installing more than one driver resolution (see the warning
+above) — two driver packages end up fighting over the same kernel module and
+the display manager fails to start. Recover from a text console:
+`Ctrl+Alt+F3` (try F2–F6 if F3 doesn't land on a login prompt), log in, then:
+
+```bash
+# What's actually installed — look for more than one version, or entries
+# not starting with "ii" (a half-configured package)
+dpkg -l | grep nvidia-driver
+
+# The actual error, almost always near the bottom
+dmesg | grep -i nvidia | tail -20
+```
+
+The fix in the common case is a clean reset — purge every NVIDIA driver
+package and let `ubuntu-drivers` resolve exactly one, rather than trying to
+figure out which of the two conflicting installs to keep:
+
+```bash
+sudo apt purge -y 'nvidia-*'
+sudo apt autoremove -y
+sudo ubuntu-drivers autoinstall
+sudo reboot
+```
+
+If `dmesg` instead shows something like `Key was rejected by service`, the
+cause is different: Secure Boot is on, and the NVIDIA kernel module is
+unsigned. Either disable Secure Boot in the firmware setup, or enroll the
+signing key DKMS already generated:
+
+```bash
+sudo mokutil --import /var/lib/shim-signed/mok/MOK.der
+sudo reboot
+```
+
+That reboot drops into a blue **MOK Manager** screen before Ubuntu loads —
+"Enroll MOK" → confirm → reboot again, and the module loads on the next boot.
+
+If `Ctrl+Alt+F3` doesn't reach a login prompt at all, reboot, hold `Shift` (or
+`Esc` on UEFI) to reach the GRUB menu, choose **Advanced options for
+Ubuntu → recovery mode**, then **root shell**. Run `dpkg --configure -a`
+first if apt reports a half-configured package, then the purge/autoinstall
+commands above.
+
+`emergency-uninstall.sh` is not the tool for this: it deliberately never
+touches driver packages, so it cannot repair a conflicted driver install —
+that has to be a manual `apt purge` as above.
 
 ### Installing ROCm (AMD)
 
