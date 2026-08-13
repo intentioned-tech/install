@@ -1236,12 +1236,29 @@ else
             echo -e "${YELLOW}   Found $(printf '%s\n' "$DIST_UNITS" | wc -l) unit file(s) in the release.${NC}"
         fi
 
+        # Some placeholders are the name of another unit in the same set — a
+        # timer's Unit= pointing at its payload, an updater restarting the
+        # server. Resolve those from what was actually discovered, so a release
+        # that renames a unit still wires up correctly.
+        UNIT_SERVER_NAME=""
+        UNIT_UPDATER_NAME=""
+        UNIT_TIMER_NAME=""
+        for _src in $DIST_UNITS; do
+            _n="$(_unit_name_for "$_src")"
+            case "$_n" in
+                *updater*.service) [ -n "$UNIT_UPDATER_NAME" ] || UNIT_UPDATER_NAME="$_n" ;;
+                *.timer)           [ -n "$UNIT_TIMER_NAME" ]   || UNIT_TIMER_NAME="$_n" ;;
+                *.service)         [ -n "$UNIT_SERVER_NAME" ]  || UNIT_SERVER_NAME="$_n" ;;
+            esac
+        done
+
         # Templates carry placeholders for what only the installing machine
         # knows. Four spellings are substituted — __NAME__, @NAME@, {{NAME}}
         # and %NAME% — because the convention differs per packaging tool and
         # guessing one wrong leaves a unit that fails at start. ${NAME} is
         # deliberately not touched: systemd expands that itself.
         _UNIT_VARS=(
+            "DIST_DIR=${SERVER_DIR}"
             "INSTALL_PATH=${SERVER_DIR}"
             "INSTALL_DIR=${SERVER_DIR}"
             "APP_DIR=${SERVER_DIR}"
@@ -1255,6 +1272,12 @@ else
             "VENV_PATH=${REPO_PATH}/myenv"
             "ENTRY=${SERVER_ENTRY}"
             "ENTRY_POINT=${SERVER_DIR}/${SERVER_ENTRY}"
+            "SERVICE=${UNIT_SERVER_NAME}"
+            "SERVICE_NAME=${UNIT_SERVER_NAME}"
+            "SERVER_SERVICE=${UNIT_SERVER_NAME}"
+            "UPDATER_SERVICE=${UNIT_UPDATER_NAME}"
+            "UPDATER_TIMER=${UNIT_TIMER_NAME}"
+            "TIMER=${UNIT_TIMER_NAME}"
         )
 
         for _src in $DIST_UNITS; do
@@ -1264,6 +1287,10 @@ else
             for _kv in "${_UNIT_VARS[@]}"; do
                 _k="${_kv%%=*}"
                 _v="${_kv#*=}"
+                # An empty value means the thing it names was not found. Leaving
+                # the placeholder in place lets the check below report it, rather
+                # than substituting nothing and installing a broken unit.
+                [ -n "$_v" ] || continue
                 sed -i -e "s#__${_k}__#${_v}#g" \
                        -e "s#@${_k}@#${_v}#g" \
                        -e "s#{{[[:space:]]*${_k}[[:space:]]*}}#${_v}#g" \
