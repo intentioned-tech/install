@@ -174,6 +174,19 @@ USER_UNITS=""
 if [ "$PLATFORM" = "Linux" ] && command_exists systemctl; then
     SYSTEM_UNITS="$(systemctl list-unit-files --no-legend --no-pager 'intentioned*' 2>/dev/null | awk '{print $1}' || true)"
     USER_UNITS="$(systemctl --user list-unit-files --no-legend --no-pager 'intentioned*' 2>/dev/null | awk '{print $1}' || true)"
+
+    # The units come from the release, so their names are not guaranteed to
+    # match intentioned*. install.sh records exactly what it installed; fold
+    # that in so a differently-named unit is not left running afterwards.
+    if [ -r "$INSTALL_PATH/.installed_units" ]; then
+        while IFS= read -r _u; do
+            [ -n "$_u" ] || continue
+            case " $SYSTEM_UNITS " in
+                *" $_u "*) ;;
+                *) SYSTEM_UNITS="$SYSTEM_UNITS $_u" ;;
+            esac
+        done < "$INSTALL_PATH/.installed_units"
+    fi
 fi
 
 # ---------------------------------------------------------------------------

@@ -256,18 +256,27 @@ Environment equivalents: `INTENTIONED_USERNAME`, `INTENTIONED_PASSWORD`,
 
 ### Running as a service
 
-On Linux, the installer sets up `intentioned-server.service` — a systemd unit
-that runs the app as a background daemon, enabled to start at boot:
+On Linux, the installer finds the `.service` and `.timer` files shipped in the
+release, fills in any placeholders, installs them to `/etc/systemd/system`, and
+enables them so they survive a reboot. That is typically the server, the
+nightly updater, and the timer that drives it:
 
 ```bash
 systemctl status intentioned-server.service
 journalctl -u intentioned-server.service -f
+systemctl list-timers 'intentioned*'                # when the next update runs
 sudo systemctl restart intentioned-server.service   # no password needed
 ```
 
-That last one works passwordless by design: the installer also writes
-`/etc/sudoers.d/intentioned-restart`, scoped to exactly that one command for
-the installing user, so the app's own config tool can restart the service
+Units are discovered rather than named, so a release that adds or renames one
+needs no installer change. Long-running services are started immediately;
+`Type=oneshot` units are enabled but deliberately **not** started, since
+starting the updater would run an update in the middle of the install — its
+timer triggers it on schedule instead.
+
+The passwordless restart is by design: the installer also writes
+`/etc/sudoers.d/intentioned-restart`, scoped to `restart` on exactly the
+services it installed, so the app's own config tool can restart the server
 after a settings change without prompting.
 
 The `intentioned` launcher in `~/.local/bin` still runs a separate, **foreground**
@@ -280,8 +289,10 @@ Skip all of this with `--no-systemd-service` (always skipped on macOS, which
 has no systemd) — the foreground launcher is created either way and is the
 only way to run the app if you skip the service.
 
-`emergency-uninstall.sh` already discovers and removes any `intentioned*`
-systemd unit and the sudoers rule automatically; no separate cleanup is needed.
+The installed unit names are recorded in `.installed_units` in the install
+directory. `emergency-uninstall.sh` reads that file — as well as matching
+`intentioned*` — so it stops and removes every unit that was installed, even
+one whose name does not match that pattern, along with the sudoers rule.
 
 ## System dependencies (`install-deps.sh`)
 

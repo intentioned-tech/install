@@ -1077,119 +1077,185 @@ else
 fi
 
 # Setup the systemd service, and passwordless sudo to restart it
-echo -e "\n${YELLOW}[7/8] Setting up the systemd service...${NC}"
+echo -e "\n${YELLOW}[7/8] Setting up systemd units...${NC}"
 CURRENT_USER=$(whoami)
 SUDOERS_FILE="/etc/sudoers.d/intentioned-restart"
-SERVICE_NAME="intentioned-server.service"
-SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
+UNIT_MANIFEST="$INSTALL_PATH/.installed_units"
 SERVICE_INSTALLED=false
+INSTALLED_UNITS=""
+INSTALLED_SERVICES=""
+ONESHOT_UNITS=""
+TIMER_UNITS=""
 
 if [ "$PLATFORM" != "Linux" ]; then
-    echo -e "${YELLOW}   Skipping systemd service and sudoers setup (not supported on ${PLATFORM}).${NC}"
+    echo -e "${YELLOW}   Skipping systemd and sudoers setup (not supported on ${PLATFORM}).${NC}"
     echo -e "${YELLOW}   Use the 'intentioned' launcher to run the app in the foreground.${NC}"
 elif [ "$INSTALL_SYSTEMD_SERVICE" != true ]; then
     echo -e "${YELLOW}   Skipping (--no-systemd-service). Use the 'intentioned' launcher instead.${NC}"
 elif ! command_exists systemctl; then
     echo -e "${YELLOW}   No systemd on this system; skipping. Use the 'intentioned' launcher instead.${NC}"
 else
-    # GPU device nodes (/dev/nvidia*, /dev/kfd, /dev/dri/renderD*) are owned by
-    # the video/render groups. A user added to those groups mid-session (e.g. by
-    # the ROCm install steps above) does not see the membership in their current
-    # login shell until they log out and back in — but a system service's
-    # SupplementaryGroups= is resolved fresh from /etc/group at service-start
-    # time, so setting it here sidesteps that relogin requirement entirely for
-    # the service specifically. Only added when the groups actually exist:
-    # naming a nonexistent group in a unit file fails the whole service to start.
-    SERVICE_GROUPS=""
-    if [ "$SELECTED_BACKEND" = "rocm" ]; then
-        for _g in render video; do
-            getent group "$_g" >/dev/null 2>&1 && SERVICE_GROUPS="$SERVICE_GROUPS $_g"
-        done
-    fi
+    # The release ships its own unit files — the server, the nightly updater and
+    # its timer. Install those rather than generating one here: they are part of
+    # the build and change with it, so a unit written by this script would drift
+    # from whatever the release actually expects.
+    #
+    # Found rather than named, so a release that adds or renames a unit needs no
+    # change here. myenv is pruned: a virtualenv can contain unit files belonging
+    # to unrelated packages.
+    DIST_UNITS="$(find "$SERVER_DIR" -maxdepth 3 \
+        \( -type d -name myenv -prune \) -o \
+        \( -type f \( -name '*.service' -o -name '*.timer' \) -print \) 2>/dev/null | sort)"
 
-    echo -e "${YELLOW}   Writing ${SERVICE_NAME} for ${CURRENT_USER}...${NC}"
-    # --suffix matters, not just cosmetic: systemd-analyze verify refuses a
-    # bare mktemp filename ("Failed to prepare filename ...: Invalid
-    # argument") — it requires something it can resolve as a unit name.
-    TEMP_SERVICE=$(mktemp --suffix=.service)
-    {
-        echo "[Unit]"
-        echo "Description=Intentioned.tech voice coaching server"
-        echo "After=network.target"
-        echo ""
-        echo "[Service]"
-        echo "Type=simple"
-        echo "User=${CURRENT_USER}"
-        [ -n "$SERVICE_GROUPS" ] && echo "SupplementaryGroups=${SERVICE_GROUPS# }"
-        echo "WorkingDirectory=${SERVER_DIR}"
-        echo "Environment=HOME=${HOME}"
-        echo "ExecStart=${REPO_PATH}/myenv/bin/python ${SERVER_DIR}/${SERVER_ENTRY}"
-        echo "Restart=on-failure"
-        echo "RestartSec=5"
-        echo ""
-        echo "[Install]"
-        echo "WantedBy=multi-user.target"
-    } > "$TEMP_SERVICE"
+    if [ -z "$DIST_UNITS" ]; then
+        echo -e "${RED}   No .service or .timer files found under ${SERVER_DIR}.${NC}"
+        echo -e "${YELLOW}   This release ships none, or the install is incomplete.${NC}"
+        echo -e "${YELLOW}   The 'intentioned' launcher still runs the app in the foreground.${NC}"
+    else
+        echo -e "${YELLOW}   Found $(printf '%s\n' "$DIST_UNITS" | wc -l) unit file(s) in the release.${NC}"
 
-    # Best-effort: not every system has systemd-analyze (e.g. minimal containers
-    # running systemd itself but not the full package), and a missing validator
-    # should not block an otherwise-correct install.
-    SERVICE_VALID=true
-    if command_exists systemd-analyze; then
-        systemd-analyze verify "$TEMP_SERVICE" 2>/dev/null || SERVICE_VALID=false
-    fi
+        # Units are packaged with placeholders for anything only the installing
+        # machine knows. Substituted only where present, so a unit shipping
+        # absolute paths already is copied through untouched.
+        for _src in $DIST_UNITS; do
+            _unit="$(basename "$_src")"
+            _tmp="$(mktemp --suffix=".$( [ "${_unit##*.}" = timer ] && echo timer || echo service )")"
+            sed -e "s#__INSTALL_PATH__#${SERVER_DIR}#g" \
+                -e "s#__INSTALL_DIR__#${SERVER_DIR}#g" \
+                -e "s#__USER__#${CURRENT_USER}#g" \
+                -e "s#__HOME__#${HOME}#g" \
+                -e "s#__PYTHON__#${REPO_PATH}/myenv/bin/python#g" \
+                -e "s#__VENV__#${REPO_PATH}/myenv#g" \
+                "$_src" > "$_tmp"
 
-    if [ "$SERVICE_VALID" != true ]; then
-        echo -e "${RED}   Generated unit file failed validation; skipping systemd setup.${NC}"
-        echo -e "${YELLOW}   Inspect it: systemd-analyze verify ${TEMP_SERVICE}${NC}"
-    # Every step from here on can fail for a reason that has nothing to do with
-    # this install being broken — most commonly, no systemd bus to talk to
-    # (containers, WSL, chroots). That must not take the rest of install.sh
-    # down with it under `set -e`, so the install+reload pair is the `if`
-    # condition itself rather than bare statements.
-    elif sudo install -o root -g root -m 0644 "$TEMP_SERVICE" "$SERVICE_FILE" && sudo systemctl daemon-reload; then
-        sudo systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
-        # restart, not start: idempotent on re-installs where paths or the venv
-        # changed since the service was last started.
-        if sudo systemctl restart "$SERVICE_NAME"; then
-            sleep 1
-            if sudo systemctl is-active --quiet "$SERVICE_NAME"; then
-                echo -e "${GREEN}   ${SERVICE_NAME} installed, enabled, and running ✓${NC}"
-                SERVICE_INSTALLED=true
+            # A leftover placeholder means the release uses a convention this
+            # script does not know about. Installing it would produce a unit
+            # that fails at start with an unhelpful error, so say so instead.
+            if grep -q '__[A-Z_]\+__' "$_tmp"; then
+                echo -e "${RED}   ${_unit}: unresolved placeholder(s):${NC}"
+                grep -o '__[A-Z_]\+__' "$_tmp" | sort -u | sed 's/^/      /'
+                echo -e "${YELLOW}   Skipping it; report these so the installer can fill them in.${NC}"
+                rm -f "$_tmp"
+                continue
+            fi
+
+            # Reported, not enforced. These units are part of the release, so
+            # refusing to install one leaves the app without a service it
+            # expects — a worse outcome than installing it and letting systemd
+            # report the real problem at start. verify is also stricter than
+            # systemd itself: it fails a unit whose ExecStart binary is not
+            # present yet, which is legitimate for anything built later.
+            if command_exists systemd-analyze && ! systemd-analyze verify "$_tmp" 2>/dev/null; then
+                echo -e "${YELLOW}   ${_unit}: did not pass validation, installing anyway.${NC}"
+                echo -e "${YELLOW}   Inspect: systemd-analyze verify ${_src}${NC}"
+            fi
+
+            # Read from the staged copy while it is still here. Re-reading the
+            # installed path instead was a bug: on any failure to read it, a
+            # Type=oneshot updater looked long-running and got started
+            # immediately — running an update in the middle of the install.
+            _is_oneshot=false
+            grep -qiE '^[[:space:]]*Type=oneshot' "$_tmp" && _is_oneshot=true
+
+            if sudo install -o root -g root -m 0644 "$_tmp" "/etc/systemd/system/${_unit}"; then
+                INSTALLED_UNITS="$INSTALLED_UNITS $_unit"
+                case "$_unit" in
+                    *.timer) TIMER_UNITS="$TIMER_UNITS $_unit" ;;
+                    *.service)
+                        if [ "$_is_oneshot" = true ]; then
+                            ONESHOT_UNITS="$ONESHOT_UNITS $_unit"
+                        else
+                            INSTALLED_SERVICES="$INSTALLED_SERVICES $_unit"
+                        fi
+                        ;;
+                esac
+                echo -e "${GREEN}   ${_unit} installed ✓${NC}"
             else
-                echo -e "${YELLOW}   ${SERVICE_NAME} installed but exited after starting.${NC}"
-                echo -e "${YELLOW}   Check config.json, then: journalctl -u ${SERVICE_NAME} -n 50${NC}"
-                SERVICE_INSTALLED=true
+                echo -e "${RED}   ${_unit}: could not be installed.${NC}"
+            fi
+            rm -f "$_tmp"
+        done
+
+        if [ -n "$INSTALLED_UNITS" ] && sudo systemctl daemon-reload; then
+            # Record what was installed so emergency-uninstall.sh removes exactly
+            # these, rather than guessing from a name pattern.
+            printf '%s\n' $INSTALLED_UNITS | sudo tee "$UNIT_MANIFEST" >/dev/null 2>&1 || true
+
+            for _unit in $INSTALLED_UNITS; do
+                # Enabling is what survives a reboot; a unit with no [Install]
+                # section (a timer's oneshot payload, typically) legitimately
+                # cannot be enabled, so that failure is not reported as an error.
+                sudo systemctl enable "$_unit" >/dev/null 2>&1 || true
+            done
+
+            # A oneshot is the payload of a timer. Enabled above so it survives a
+            # reboot, but deliberately not started: starting the updater here
+            # would run an update in the middle of the install.
+            for _unit in $ONESHOT_UNITS; do
+                echo -e "${GREEN}   ${_unit} installed (oneshot; left for its timer) ✓${NC}"
+            done
+
+            for _unit in $TIMER_UNITS; do
+                if sudo systemctl restart "$_unit"; then
+                    echo -e "${GREEN}   ${_unit} enabled and started ✓${NC}"
+                else
+                    echo -e "${YELLOW}   ${_unit} installed but would not start.${NC}"
+                fi
+            done
+
+            for _unit in $INSTALLED_SERVICES; do
+                if sudo systemctl restart "$_unit"; then
+                    sleep 1
+                    if sudo systemctl is-active --quiet "$_unit"; then
+                        echo -e "${GREEN}   ${_unit} enabled and running ✓${NC}"
+                    else
+                        echo -e "${YELLOW}   ${_unit} started but exited.${NC}"
+                        echo -e "${YELLOW}   Check: journalctl -u ${_unit} -n 50${NC}"
+                    fi
+                    SERVICE_INSTALLED=true
+                else
+                    echo -e "${RED}   ${_unit} failed to start.${NC}"
+                    echo -e "${YELLOW}   Check: journalctl -u ${_unit} -n 50${NC}"
+                fi
+            done
+        elif [ -n "$INSTALLED_UNITS" ]; then
+            echo -e "${RED}   daemon-reload failed (no systemd bus reachable?).${NC}"
+            echo -e "${YELLOW}   Use the 'intentioned' launcher, or re-run with --no-systemd-service.${NC}"
+        fi
+    fi
+
+    # The app's config tool restarts the server after a settings change, so the
+    # rule covers every long-running service that was actually installed —
+    # scoped to `restart` on those specific units, not blanket systemctl access.
+    if [ -z "$INSTALLED_SERVICES" ]; then
+        echo -e "${YELLOW}   No long-running service installed; skipping the sudoers rule.${NC}"
+    else
+        echo -e "${YELLOW}   Creating sudoers rule for ${CURRENT_USER}...${NC}"
+        _sudo_cmds=""
+        for _unit in $INSTALLED_SERVICES; do
+            _sudo_cmds="${_sudo_cmds}, /usr/bin/systemctl restart ${_unit}"
+        done
+        TEMP_SUDOERS=$(mktemp)
+        echo "${CURRENT_USER} ALL=(ALL) NOPASSWD:${_sudo_cmds#,}" > "$TEMP_SUDOERS"
+
+        if sudo visudo -cf "$TEMP_SUDOERS" > /dev/null 2>&1; then
+            sudo install -o root -g root -m 0440 "$TEMP_SUDOERS" "$SUDOERS_FILE"
+            echo -e "${GREEN}   Sudoers rule installed for:${INSTALLED_SERVICES} ✓${NC}"
+
+            _verify_unit="${INSTALLED_SERVICES%% *}"
+            _verify_unit="${_verify_unit# }"
+            if [ "$SERVICE_INSTALLED" = true ] && sudo -n systemctl status "$_verify_unit" > /dev/null 2>&1; then
+                echo -e "${GREEN}   Passwordless sudo verified ✓${NC}"
+            else
+                echo -e "${YELLOW}   Sudoers rule installed but service not running to verify against${NC}"
             fi
         else
-            echo -e "${RED}   Failed to start ${SERVICE_NAME}.${NC}"
-            echo -e "${YELLOW}   Check: journalctl -u ${SERVICE_NAME} -n 50${NC}"
+            echo -e "${RED}   Sudoers syntax validation failed${NC}"
+            echo -e "${YELLOW}   You may need to manually configure sudoers${NC}"
         fi
-    else
-        echo -e "${RED}   Could not install the systemd unit (no systemd bus reachable?).${NC}"
-        echo -e "${YELLOW}   Use the 'intentioned' launcher instead, or re-run with --no-systemd-service.${NC}"
+
+        rm -f "$TEMP_SUDOERS"
     fi
-    rm -f "$TEMP_SERVICE"
-
-    echo -e "${YELLOW}   Creating sudoers rule for ${CURRENT_USER}...${NC}"
-    TEMP_SUDOERS=$(mktemp)
-    echo "${CURRENT_USER} ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart ${SERVICE_NAME}" > "$TEMP_SUDOERS"
-
-    if sudo visudo -cf "$TEMP_SUDOERS" > /dev/null 2>&1; then
-        sudo install -o root -g root -m 0440 "$TEMP_SUDOERS" "$SUDOERS_FILE"
-        echo -e "${GREEN}   Sudoers rule installed ✓${NC}"
-
-        if [ "$SERVICE_INSTALLED" = true ] && sudo -n systemctl status "$SERVICE_NAME" > /dev/null 2>&1; then
-            echo -e "${GREEN}   Passwordless sudo verified ✓${NC}"
-        else
-            echo -e "${YELLOW}   Sudoers rule installed but service not running to verify against${NC}"
-        fi
-    else
-        echo -e "${RED}   Sudoers syntax validation failed${NC}"
-        echo -e "${YELLOW}   You may need to manually configure sudoers${NC}"
-    fi
-
-    rm -f "$TEMP_SUDOERS"
 fi
 
 # Apply NeMo CUDA graph patches (fixes cu_call unpacking bug)
@@ -1291,14 +1357,19 @@ echo "║  Installation path: $INSTALL_PATH                              "
 echo "╚═══════════════════════════════════════════════════════════════╝"
 echo -e "${NC}"
 
-if [ "$SERVICE_INSTALLED" = true ]; then
-    echo -e "${CYAN}Running in the background as ${SERVICE_NAME}:${NC}"
-    echo -e "${CYAN}    systemctl status ${SERVICE_NAME}${NC}"
-    echo -e "${CYAN}    journalctl -u ${SERVICE_NAME} -f${NC}"
-    echo -e "${CYAN}    sudo systemctl restart ${SERVICE_NAME}   (no password needed)${NC}"
-    echo -e "${CYAN}The 'intentioned' launcher above runs a separate foreground copy —${NC}"
-    echo -e "${CYAN}stop the service first (sudo systemctl stop ${SERVICE_NAME}) to avoid${NC}"
-    echo -e "${CYAN}two instances competing for the same port and GPU.${NC}"
+if [ -n "$INSTALLED_UNITS" ]; then
+    echo -e "${CYAN}systemd units installed:${INSTALLED_UNITS}${NC}"
+    echo -e "${CYAN}    systemctl status${INSTALLED_UNITS}${NC}"
+    echo -e "${CYAN}    systemctl list-timers 'intentioned*'${NC}"
+    for _unit in $INSTALLED_SERVICES; do
+        echo -e "${CYAN}    journalctl -u ${_unit} -f${NC}"
+        echo -e "${CYAN}    sudo systemctl restart ${_unit}   (no password needed)${NC}"
+    done
+    if [ "$SERVICE_INSTALLED" = true ]; then
+        echo -e "${CYAN}The 'intentioned' launcher above runs a separate foreground copy —${NC}"
+        echo -e "${CYAN}stop the service first to avoid two instances competing for the${NC}"
+        echo -e "${CYAN}same port and GPU.${NC}"
+    fi
     echo ""
 fi
 
