@@ -350,13 +350,13 @@ fi
 
 # Check for Tk (tkinter)
 #
-# config_tool.py is a tkinter GUI, and tkinter is the one stdlib module distros
+# run_config_tool.py is a tkinter GUI, and tkinter is the one stdlib module distros
 # routinely omit: it lives in a separate `-tk` package. A venv inherits the
 # omission from the interpreter it was built on, so `pip install` cannot fix it
 # afterwards — the package has to be there before myenv is created.
 #
 # Every detected interpreter is covered, not just the 3.12 this install will
-# use. Which one config_tool.py ends up running under depends on the venv, on
+# use. Which one run_config_tool.py ends up running under depends on the venv, on
 # $INTENTIONED_PYTHON and on whatever the operator upgrades to next, and the
 # packages are a few hundred KB each.
 TK_MIN_MINOR=9
@@ -1067,14 +1067,17 @@ echo -e "${GREEN}   Dependencies installed ✓${NC}"
 # restart-looping service with "can't open file '.../server.py': [Errno 2] No
 # such file or directory".
 SERVER_ENTRY="run_server.py"
+CONFIG_ENTRY="run_config_tool.py"
 SERVER_DIR="$INSTALL_PATH"
 
-if [ -f "$SERVER_DIR/$SERVER_ENTRY" ]; then
-    echo -e "${GREEN}   Entry point: ${SERVER_DIR}/${SERVER_ENTRY} ✓${NC}"
-else
-    echo -e "${RED}   ${SERVER_DIR}/${SERVER_ENTRY} is missing — the install looks incomplete.${NC}"
-    echo -e "${YELLOW}   The launchers and the service will still be written pointing at it.${NC}"
-fi
+for _e in "$SERVER_ENTRY" "$CONFIG_ENTRY"; do
+    if [ -f "$SERVER_DIR/$_e" ]; then
+        echo -e "${GREEN}   Entry point: ${SERVER_DIR}/${_e} ✓${NC}"
+    else
+        echo -e "${RED}   ${SERVER_DIR}/${_e} is missing — the install looks incomplete.${NC}"
+        echo -e "${YELLOW}   The launchers will still be written pointing at it.${NC}"
+    fi
+done
 
 # Setup the systemd service, and passwordless sudo to restart it
 echo -e "\n${YELLOW}[7/8] Setting up systemd units...${NC}"
@@ -1436,7 +1439,7 @@ cat > "$USER_BIN/intentioned-config" << EOF
 #!/bin/bash
 cd "$SERVER_DIR"
 source "$REPO_PATH/myenv/bin/activate"
-python config_tool.py
+python "$CONFIG_ENTRY"
 EOF
 chmod +x "$USER_BIN/intentioned-config"
 
@@ -1523,7 +1526,7 @@ if [ "$OPEN_CONFIG" = true ]; then
         echo -e "${CYAN}Opening Configuration Tool...${NC}"
         cd "$SERVER_DIR"
         source "$REPO_PATH/myenv/bin/activate"
-        python config_tool.py
+        python "$CONFIG_ENTRY"
     fi
 fi
 
