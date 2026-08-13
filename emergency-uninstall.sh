@@ -26,6 +26,7 @@ KEEP_MODELS=false
 KEEP_CACHE=false
 KEEP_SHELL_RC=false
 KEEP_SYSTEM_PACKAGES=false
+REMOVE_GIT_CURL=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -36,6 +37,7 @@ while [[ $# -gt 0 ]]; do
         --keep-cache)     KEEP_CACHE=true; shift ;;
         --keep-shell-rc)  KEEP_SHELL_RC=true; shift ;;
         --keep-system-packages) KEEP_SYSTEM_PACKAGES=true; shift ;;
+        --remove-git-curl) REMOVE_GIT_CURL=true; shift ;;
         # Accepted and ignored: removing system packages is the default now.
         --system-packages) shift ;;
         -h|--help)
@@ -63,6 +65,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --keep-system-packages"
             echo "                       Keep gcc, cmake, CUDA, Tk and ffmpeg. Use this to"
             echo "                       remove only the app and its caches."
+            echo "  --remove-git-curl    ALSO remove git and curl. Off by default: curl is"
+            echo "                       what fetches install.sh and this script in the first"
+            echo "                       place, and other software commonly shells out to git."
             echo "  -h, --help           Show this message"
             exit 0
             ;;
@@ -204,11 +209,18 @@ PROTECTED_RE="(^gcc-[0-9.]+-base$|^libgcc-s1$|^libgcc1$|^libstdc\+\+6$|^libc6$|^
 
 # What a deep clean is allowed to consider. Deliberately absent: git, curl,
 # ca-certificates and the Python interpreters. They predate this app on any real
-# machine and removing them breaks unrelated tooling.
+# machine and removing them breaks unrelated tooling. git and curl can be added
+# back in with --remove-git-curl; ca-certificates and the interpreters cannot,
+# since removing either breaks apt/dnf/pacman/zypper themselves on many systems.
 case "$PLATFORM" in
     macOS) DEV_RE='^(cmake|ninja|pkg-config|ffmpeg|zstd|python-tk(@.*)?)$' ;;
     *)     DEV_RE='^(build-essential|gcc|g\+\+|cpp|gcc-[0-9]+|g\+\+-[0-9]+|cpp-[0-9]+|gcc-c\+\+|libstdc\+\+-[0-9]+-dev|libstdc\+\+-devel|libgcc-[0-9]+-dev|libc6-dev|libc-dev-bin|glibc-devel|linux-libc-dev|make|cmake|cmake-data|ninja|ninja-build|pkg-config|pkgconf|pkgconf-bin|libpkgconf[0-9]*|pkgconfig|ffmpeg|zstd|tk|python3(\.[0-9]+)?-tk|python3(\.[0-9]+)?-dev|python3(\.[0-9]+)?-devel|python3(\.[0-9]+)?-tkinter|python[0-9]+-tk|python[0-9]+-devel|libpython3(\.[0-9]+)?-dev|nvidia-cuda-toolkit|nvidia-cuda-dev|cuda|cuda-toolkit.*|cuda-[a-z].*|libcudnn.*|libcublas.*|libcufft.*|libcurand.*|libcusolver.*|libcusparse.*|libnpp.*|libnvjitlink.*|libnvrtc.*|libnvjpeg.*)$' ;;
 esac
+
+# Opt-in, not folded into DEV_RE: this is a much smaller, hand-picked set
+# (just the two commands, not their libraries — libcurlN stays, since removing
+# it would cascade into anything on the box linked against it).
+GIT_CURL_RE='^(git|curl)$'
 
 PKG=""
 if [ "$PLATFORM" = "macOS" ]; then
@@ -262,31 +274,72 @@ KEPT_DRIVERS=""
 BATCH_SAFE=true
 if [ "$KEEP_SYSTEM_PACKAGES" != true ] && [ -n "$PKG" ]; then
     echo -e "${YELLOW}Working out which development packages can be removed safely...${NC}"
+
+    # Guard 1+2 first, over every installed package: cheap regex matching, no
+    # package-manager calls. Curated-set membership (or git/curl under
+    # --remove-git-curl) and self-protection are decided here.
+    CANDIDATES=""
     for _p in $(installed_packages | sort -u); do
-        # Guard 1+2: in the curated set, and not itself protected.
-        printf '%s' "$_p" | grep -qE "$DEV_RE" || continue
+        if ! printf '%s' "$_p" | grep -qE "$DEV_RE"; then
+            if [ "$REMOVE_GIT_CURL" != true ] || ! printf '%s' "$_p" | grep -qE "$GIT_CURL_RE"; then
+                continue
+            fi
+        fi
         if printf '%s' "$_p" | grep -qE "$PROTECTED_RE"; then
             KEPT_DRIVERS="$KEPT_DRIVERS $_p"
             continue
         fi
-        # Guard 3: would removing this drag a protected package out with it?
-        if touches_protected "$(simulate_removal "$_p")"; then
-            SKIPPED_PKGS="$SKIPPED_PKGS $_p"
-            continue
-        fi
-        REMOVE_PKGS="$REMOVE_PKGS $_p"
+        CANDIDATES="$CANDIDATES $_p"
     done
 
-    # Removals interact: a set can orphan something no single member would.
-    # Re-simulate the whole list and fall back to package-at-a-time if so.
-    BATCH_SAFE=true
-    if [ -n "$REMOVE_PKGS" ]; then
+    # Guard 3, batched: `apt-get purge -s` runs a full dependency solve, which
+    # costs a few seconds per call — cheap once, but a machine with several
+    # dozen candidate packages turns a call-per-package loop into a minute or
+    # more of silent "computing" before the confirmation prompt even shows.
+    # One simulate of the whole candidate set costs the same single solve and
+    # covers both guard 3 (does any candidate drag out something protected)
+    # and the old separate "removals interact" batch check at once — a set
+    # that's clean together is clean individually too.
+    if [ -n "$CANDIDATES" ]; then
         # shellcheck disable=SC2086
-        if touches_protected "$(simulate_removal $REMOVE_PKGS)"; then
-            BATCH_SAFE=false
+        if touches_protected "$(simulate_removal $CANDIDATES)"; then
+            # A real conflict: fall back to finding which candidate(s) are
+            # responsible. This path is the slow one, but it is now the
+            # exception rather than the rule, so it earns a progress readout.
+            echo -e "${YELLOW}   A conflict was found; checking candidates individually...${NC}"
+            for _p in $CANDIDATES; do
+                printf '.' >&2
+                if touches_protected "$(simulate_removal "$_p")"; then
+                    SKIPPED_PKGS="$SKIPPED_PKGS $_p"
+                else
+                    REMOVE_PKGS="$REMOVE_PKGS $_p"
+                fi
+            done
+            echo "" >&2
+            # The individually-clean survivors can still interact as a set;
+            # this is the same check the fast path skips because a jointly
+            # clean CANDIDATES set makes it redundant.
+            if [ -n "$REMOVE_PKGS" ]; then
+                # shellcheck disable=SC2086
+                if touches_protected "$(simulate_removal $REMOVE_PKGS)"; then
+                    BATCH_SAFE=false
+                fi
+            fi
+        else
+            REMOVE_PKGS="$CANDIDATES"
         fi
     fi
 fi
+
+# Whether git/curl actually made it into the removal set — --remove-git-curl
+# was requested does not guarantee it: guard 2 or guard 3 could still have
+# skipped either one. Used below for the plan warning and the closing summary.
+GIT_REMOVED=false
+CURL_REMOVED=false
+for _p in $REMOVE_PKGS; do
+    [ "$_p" = "git" ]  && GIT_REMOVED=true
+    [ "$_p" = "curl" ] && CURL_REMOVED=true
+done
 
 # ---------------------------------------------------------------------------
 # Show the plan
@@ -341,6 +394,13 @@ if [ -n "$REMOVE_PKGS" ]; then
         echo -e "${YELLOW}Batch removal would touch a protected package; removing one at a${NC}"
         echo -e "${YELLOW}time instead and skipping any that turns unsafe.${NC}"
     fi
+    if [ "$CURL_REMOVED" = true ]; then
+        echo ""
+        echo -e "${RED}curl will be removed. It is what fetched install.sh and this script —${NC}"
+        echo -e "${RED}without it, 'curl -fsSL ... -o install.sh' and install-deps.sh's own${NC}"
+        echo -e "${RED}downloads stop working. Save any file you still need before proceeding;${NC}"
+        echo -e "${RED}your package manager can put curl back afterwards.${NC}"
+    fi
 elif [ "$KEEP_SYSTEM_PACKAGES" = true ]; then
     echo ""
     echo -e "${GREEN}Keeping the toolchain, CUDA, Tk and ffmpeg (--keep-system-packages).${NC}"
@@ -351,9 +411,12 @@ if [ "$KEEP_MODELS" = true ]; then
     echo -e "${GREEN}Keeping ~/.cache/huggingface and ~/.cache/torch (--keep-models).${NC}"
 fi
 
+NEVER_TOUCHED="GPU drivers, CUDA/ROCm kernel modules, your Python installations,"
+[ "$GIT_REMOVED" = true ]  || NEVER_TOUCHED="$NEVER_TOUCHED git,"
+[ "$CURL_REMOVED" = true ] || NEVER_TOUCHED="$NEVER_TOUCHED curl,"
+NEVER_TOUCHED="$NEVER_TOUCHED and anything outside the paths above."
 echo ""
-echo -e "${GREEN}Never touched: GPU drivers, CUDA/ROCm kernel modules, your Python${NC}"
-echo -e "${GREEN}installations, git, curl, and anything outside the paths above.${NC}"
+echo -e "${GREEN}Never touched: ${NEVER_TOUCHED}${NC}"
 
 if [ "$DRY_RUN" = true ]; then
     echo ""
@@ -520,5 +583,8 @@ echo -e "${NC}"
 echo -e "${YELLOW}Your GPU drivers were not touched.${NC}"
 if [ "$KEEP_MODELS" = true ]; then
     echo -e "${YELLOW}Model caches kept at ~/.cache/huggingface and ~/.cache/torch.${NC}"
+fi
+if [ "$CURL_REMOVED" = true ]; then
+    echo -e "${RED}curl is gone. Reinstall it before trying to fetch install.sh again.${NC}"
 fi
 echo -e "${CYAN}Open a new shell to drop the removed PATH entry.${NC}"

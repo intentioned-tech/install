@@ -315,15 +315,25 @@ It prints every path it will delete, with sizes, and requires you to type
 | `--keep-cache` | Keep the pip cache too |
 | `--keep-shell-rc` | Do not touch `~/.bashrc` / `~/.zshrc` |
 | `--keep-system-packages` | Keep gcc, cmake, CUDA, Tk and ffmpeg — remove only the app and its caches |
+| `--remove-git-curl` | ALSO remove git and curl (see below — off by default for a reason) |
 | `-y`, `--yes` | Skip the typed confirmation |
 
 ### What survives
 
-**GPU drivers are never removed.** Neither are kernel modules, the display
-stack, or the C runtime (`libgcc-s1`, `libstdc++6`, `gcc-N-base`, `libc6`) that
-every binary on the machine links against. `git`, `curl` and your Python
-interpreters are left alone too — they predate this app and other tooling
-depends on them.
+**GPU drivers are never removed, under any flag.** Neither are kernel modules,
+the display stack, or the C runtime (`libgcc-s1`, `libstdc++6`, `gcc-N-base`,
+`libc6`) that every binary on the machine links against — there is no flag that
+touches these.
+
+`git`, `curl` and your Python interpreters are left alone by default, but for a
+softer reason: they predate this app and other tooling depends on them, not
+because removing them is unsafe. `git` and `curl` can be added back in with
+`--remove-git-curl`, routed through the same driver/kernel/runtime guards as
+everything else. Think before using it, though: `curl` is what fetches
+`install.sh` and this uninstaller in the first place — the script warns and
+tells you when it's about to remove it, but re-running the documented
+`curl -fsSL ... -o install.sh` afterwards will not work until you reinstall it.
+Your Python interpreters have no equivalent flag; they are never removed.
 
 Keeping the driver while removing gcc and CUDA is the hard part: `cuda`,
 `cuda-drivers` and `nvidia-driver-*` share a dependency graph, and Fedora's
@@ -343,6 +353,13 @@ No orphan sweep is used — no `apt --auto-remove`, no `pacman -Rs`, no
 `libstdc++-N-dev` and friends explicitly, because an orphan sweep is exactly
 how "remove gcc" ends up removing a DKMS-built driver. Support libraries left
 behind are harmless; `apt autoremove` will collect them if you want.
+
+Guard 3 simulates the whole candidate set in one package-manager call, not one
+call per package — a dependency solve costs a few seconds each, and a machine
+with several dozen removable packages would otherwise spend a minute or more
+computing the plan before the confirmation prompt even shows. The (rare)
+per-package fallback only runs if that batch simulation actually finds a
+conflict, to pin down which package is responsible.
 
 After removing packages the script re-runs `nvidia-smi` (and `rocminfo`) and
 reports whether the driver still works.
