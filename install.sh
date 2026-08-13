@@ -1113,27 +1113,66 @@ else
             *) UNIT_SEARCH_DIRS="$UNIT_SEARCH_DIRS $_ud" ;;
         esac
     done
+    # The units are shipped as templates, so the filename carries a suffix past
+    # the unit type — intentioned-server.service.template and the like. Matching
+    # only bare *.service found nothing at all. Both forms are accepted, and the
+    # unit name is whatever precedes the .service / .timer.
+    #
+    # Editor and packaging leftovers sitting beside a template would otherwise
+    # be installed as if they were units.
+    _unit_name_for() {
+        local _n
+        _n="$(basename "$1")"
+        case "$_n" in
+            *.service|*.service.*) echo "${_n%%.service*}.service" ;;
+            *.timer|*.timer.*)     echo "${_n%%.timer*}.timer" ;;
+        esac
+    }
+
+    _is_junk() {
+        case "$1" in
+            *~|*.bak|*.orig|*.rej|*.swp|*.dpkg-*|*.rpm*|*.disabled) return 0 ;;
+        esac
+        return 1
+    }
+
+    # Deduplicated by resolved unit name, not by path: with both a rendered
+    # foo.service and a foo.service.template present, the bare file is already
+    # the output and is taken, since the plain globs are listed first.
     DIST_UNITS=""
+    _seen_units=""
+    _collect_unit() {
+        local _src="$1" _name
+        [ -f "$_src" ] || return 0
+        _is_junk "$_src" && return 0
+        _name="$(_unit_name_for "$_src")"
+        [ -n "$_name" ] || return 0
+        case " $_seen_units " in
+            *" $_name "*) return 0 ;;
+        esac
+        _seen_units="$_seen_units $_name"
+        DIST_UNITS="$DIST_UNITS $_src"
+    }
+
     for _ud in $UNIT_SEARCH_DIRS; do
         [ -d "$_ud" ] || continue
-        for _uf in "$_ud"/*.service "$_ud"/*.timer; do
-            [ -f "$_uf" ] || continue
-            case " $DIST_UNITS " in
-                *" $_uf "*) ;;
-                *) DIST_UNITS="$DIST_UNITS $_uf" ;;
-            esac
+        for _uf in "$_ud"/*.service "$_ud"/*.timer "$_ud"/*.service.* "$_ud"/*.timer.*; do
+            _collect_unit "$_uf"
         done
     done
-    DIST_UNITS="$(printf '%s\n' $DIST_UNITS | sort)"
 
     # Anywhere else under the install tree, for a release that moves them.
     # myenv is pruned: a virtualenv can contain unit files belonging to
     # unrelated packages.
     if [ -z "$DIST_UNITS" ]; then
-        DIST_UNITS="$(find "$SERVER_DIR" -maxdepth 6 \
+        for _uf in $(find "$SERVER_DIR" -maxdepth 6 \
             \( -type d -name myenv -prune \) -o \
-            \( -type f \( -name '*.service' -o -name '*.timer' \) -print \) 2>/dev/null | sort)"
+            \( -type f \( -name '*.service' -o -name '*.timer' \
+                       -o -name '*.service.*' -o -name '*.timer.*' \) -print \) 2>/dev/null | sort); do
+            _collect_unit "$_uf"
+        done
     fi
+    DIST_UNITS="$(printf '%s\n' $DIST_UNITS | sort)"
 
     GENERATED_UNIT_DIR=""
     if [ -z "$DIST_UNITS" ]; then
@@ -1194,26 +1233,48 @@ else
             echo -e "${YELLOW}   Found $(printf '%s\n' "$DIST_UNITS" | wc -l) unit file(s) in the release.${NC}"
         fi
 
-        # Units are packaged with placeholders for anything only the installing
-        # machine knows. Substituted only where present, so a unit shipping
-        # absolute paths already is copied through untouched.
-        for _src in $DIST_UNITS; do
-            _unit="$(basename "$_src")"
-            _tmp="$(mktemp --suffix=".$( [ "${_unit##*.}" = timer ] && echo timer || echo service )")"
-            sed -e "s#__INSTALL_PATH__#${SERVER_DIR}#g" \
-                -e "s#__INSTALL_DIR__#${SERVER_DIR}#g" \
-                -e "s#__USER__#${CURRENT_USER}#g" \
-                -e "s#__HOME__#${HOME}#g" \
-                -e "s#__PYTHON__#${REPO_PATH}/myenv/bin/python#g" \
-                -e "s#__VENV__#${REPO_PATH}/myenv#g" \
-                "$_src" > "$_tmp"
+        # Templates carry placeholders for what only the installing machine
+        # knows. Four spellings are substituted — __NAME__, @NAME@, {{NAME}}
+        # and %NAME% — because the convention differs per packaging tool and
+        # guessing one wrong leaves a unit that fails at start. ${NAME} is
+        # deliberately not touched: systemd expands that itself.
+        _UNIT_VARS=(
+            "INSTALL_PATH=${SERVER_DIR}"
+            "INSTALL_DIR=${SERVER_DIR}"
+            "APP_DIR=${SERVER_DIR}"
+            "WORKING_DIR=${SERVER_DIR}"
+            "WORKDIR=${SERVER_DIR}"
+            "USER=${CURRENT_USER}"
+            "GROUP=$(id -gn 2>/dev/null || echo "${CURRENT_USER}")"
+            "HOME=${HOME}"
+            "PYTHON=${REPO_PATH}/myenv/bin/python"
+            "VENV=${REPO_PATH}/myenv"
+            "VENV_PATH=${REPO_PATH}/myenv"
+            "ENTRY=${SERVER_ENTRY}"
+            "ENTRY_POINT=${SERVER_DIR}/${SERVER_ENTRY}"
+        )
 
-            # A leftover placeholder means the release uses a convention this
-            # script does not know about. Installing it would produce a unit
-            # that fails at start with an unhelpful error, so say so instead.
-            if grep -q '__[A-Z_]\+__' "$_tmp"; then
+        for _src in $DIST_UNITS; do
+            _unit="$(_unit_name_for "$_src")"
+            _tmp="$(mktemp --suffix=".${_unit##*.}")"
+            cp "$_src" "$_tmp"
+            for _kv in "${_UNIT_VARS[@]}"; do
+                _k="${_kv%%=*}"
+                _v="${_kv#*=}"
+                sed -i -e "s#__${_k}__#${_v}#g" \
+                       -e "s#@${_k}@#${_v}#g" \
+                       -e "s#{{[[:space:]]*${_k}[[:space:]]*}}#${_v}#g" \
+                       -e "s#%${_k}%#${_v}#g" "$_tmp"
+            done
+
+            # A leftover placeholder means the release uses a name this script
+            # does not know. Installing it would produce a unit that fails at
+            # start with an unhelpful error, so say so instead. %NAME% needs two
+            # or more characters to avoid matching systemd's own %h, %n and %i.
+            _left="$(grep -oE '__[A-Z_]+__|@[A-Z_]+@|\{\{[[:space:]]*[A-Z_]+[[:space:]]*\}\}|%[A-Z_]{2,}%' "$_tmp" | sort -u || true)"
+            if [ -n "$_left" ]; then
                 echo -e "${RED}   ${_unit}: unresolved placeholder(s):${NC}"
-                grep -o '__[A-Z_]\+__' "$_tmp" | sort -u | sed 's/^/      /'
+                printf '%s\n' "$_left" | sed 's/^/      /'
                 echo -e "${YELLOW}   Skipping it; report these so the installer can fill them in.${NC}"
                 rm -f "$_tmp"
                 continue
