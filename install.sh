@@ -1316,9 +1316,14 @@ else
             # report the real problem at start. verify is also stricter than
             # systemd itself: it fails a unit whose ExecStart binary is not
             # present yet, which is legitimate for anything built later.
-            if command_exists systemd-analyze && ! systemd-analyze verify "$_tmp" 2>/dev/null; then
-                echo -e "${YELLOW}   ${_unit}: did not pass validation, installing anyway.${NC}"
-                echo -e "${YELLOW}   Inspect: systemd-analyze verify ${_src}${NC}"
+            if command_exists systemd-analyze; then
+                # Captured, not discarded: this output names the offending
+                # directive, and throwing it away leaves "bad unit file setting"
+                # at start time as the only clue.
+                _verify_out="$(systemd-analyze verify "$_tmp" 2>&1)" || {
+                    echo -e "${YELLOW}   ${_unit}: did not pass validation, installing anyway:${NC}"
+                    printf '%s\n' "$_verify_out" | sed 's/^/      /'
+                }
             fi
 
             # Read from the staged copy while it is still here. Re-reading the
@@ -1385,8 +1390,17 @@ else
                     fi
                     SERVICE_INSTALLED=true
                 else
-                    echo -e "${RED}   ${_unit} failed to start.${NC}"
-                    echo -e "${YELLOW}   Check: journalctl -u ${_unit} -n 50${NC}"
+                    echo -e "${RED}   ${_unit} failed to start:${NC}"
+                    # systemd's own reason, inline. "bad unit file setting" on
+                    # its own does not say which setting, and the detail is in
+                    # these two places.
+                    sudo systemctl status --no-pager --lines=0 "$_unit" 2>&1 |
+                        sed 's/^/      /' | head -12
+                    if command_exists systemd-analyze; then
+                        systemd-analyze verify "/etc/systemd/system/${_unit}" 2>&1 |
+                            sed 's/^/      /' | head -12
+                    fi
+                    echo -e "${YELLOW}   Full log: journalctl -u ${_unit} -n 50${NC}"
                 fi
             done
         elif [ -n "$INSTALLED_UNITS" ]; then
