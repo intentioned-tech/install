@@ -1304,6 +1304,17 @@ else
                        -e "s#%${_k}%#${_v}#g" "$_tmp"
             done
 
+            # Collapse a doubled unit suffix. A template that writes
+            # Unit=@@UPDATER_SERVICE@@.service expects the placeholder to be the
+            # bare name, and substituting the full unit name there produced
+            # intentioned-updater.service.service — which systemd reported as
+            # "Refusing to start, unit ... to trigger not loaded". Normalising
+            # afterwards keeps both conventions working, rather than betting on
+            # which one a given template uses.
+            sed -i -e 's/\.service\.service/.service/g' \
+                   -e 's/\.timer\.timer/.timer/g' \
+                   -e 's/\.service\.timer/.timer/g' "$_tmp"
+
             # A leftover placeholder means the release uses a name this script
             # does not know. Installing it would produce a unit that fails at
             # start with an unhelpful error, so say so instead. %NAME% needs two
