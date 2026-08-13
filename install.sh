@@ -1061,51 +1061,70 @@ echo -e "${GREEN}   Dependencies installed ✓${NC}"
 
 # Locate the server entry point
 #
-# Hardcoding a filename here is what produced a restart-looping service with
-# "can't open file '.../server.py': [Errno 2] No such file or directory": the
-# entry point is run_server.py, not server.py. Resolve it once, from what is
-# actually on disk, and drive the unit file and both launchers off the result —
-# a rename in a future release then costs one entry in this list rather than
-# three silently wrong paths.
+# There are two tree layouts with two different entry points, which is what
+# produced a restart-looping service with "can't open file '.../server.py':
+# [Errno 2] No such file or directory":
 #
-# The subdirectory sweep covers a release whose tree does not sit flat in
-# $INSTALL_PATH. Only one level deep, and myenv is skipped: the venv contains
-# unrelated scripts that must never be mistaken for the app's own.
+#   * the licensed release is a Cython dist — its modules are compiled to
+#     cpython-312-*.so and run_server.py is the loader that imports them;
+#   * a development checkout has plain sources and runs server.py directly.
+#
+# Both names can be present in one tree, so the choice cannot be "first name
+# that exists". Ask the tree which kind it is — the compiled modules are the
+# thing that actually distinguishes them — rather than keying off SOURCE_MODE,
+# so that --skip-repo-download pointed at either kind still resolves correctly.
+#
+# The subdirectory sweep covers a tree that does not sit flat in $INSTALL_PATH.
+# Only one level deep, and myenv is skipped: the venv contains unrelated
+# scripts that must never be mistaken for the app's own.
+_is_cython_dist() {
+    local _f
+    for _f in "$1"/*.cpython-*.so "$1"/*/*.cpython-*.so; do
+        [ -e "$_f" ] && return 0
+    done
+    return 1
+}
+
 SERVER_ENTRY=""
 SERVER_DIR=""
-for _cand in run_server.py server.py main.py app.py; do
-    if [ -f "$INSTALL_PATH/$_cand" ]; then
-        SERVER_ENTRY="$_cand"
-        SERVER_DIR="$INSTALL_PATH"
-        break
+SERVER_FLAVOUR=""
+for _dir in "$INSTALL_PATH" "$INSTALL_PATH"/*/; do
+    _dir="${_dir%/}"
+    [ -d "$_dir" ] || continue
+    case "$_dir" in */myenv) continue ;; esac
+
+    if _is_cython_dist "$_dir"; then
+        _order="run_server.py server.py main.py app.py"
+        _flavour="Cython dist"
+    else
+        _order="server.py run_server.py main.py app.py"
+        _flavour="development checkout"
     fi
-done
-if [ -z "$SERVER_ENTRY" ]; then
-    for _sub in "$INSTALL_PATH"/*/; do
-        [ -d "$_sub" ] || continue
-        case "${_sub%/}" in */myenv) continue ;; esac
-        for _cand in run_server.py server.py main.py app.py; do
-            if [ -f "${_sub}${_cand}" ]; then
-                SERVER_ENTRY="$_cand"
-                SERVER_DIR="${_sub%/}"
-                break 2
-            fi
-        done
+
+    for _cand in $_order; do
+        if [ -f "$_dir/$_cand" ]; then
+            SERVER_ENTRY="$_cand"
+            SERVER_DIR="$_dir"
+            SERVER_FLAVOUR="$_flavour"
+            break
+        fi
     done
-fi
+    [ -n "$SERVER_ENTRY" ] && break
+done
 if [ -n "$SERVER_ENTRY" ]; then
     if [ "$SERVER_DIR" != "$INSTALL_PATH" ]; then
         echo -e "${YELLOW}   Server entry point found in ${SERVER_DIR} (not the install root).${NC}"
     fi
-    echo -e "${GREEN}   Entry point: ${SERVER_DIR}/${SERVER_ENTRY} ✓${NC}"
+    echo -e "${GREEN}   Entry point: ${SERVER_DIR}/${SERVER_ENTRY} (${SERVER_FLAVOUR}) ✓${NC}"
 else
     # Fall back to the documented layout so the launchers still get written;
     # they will report the missing file themselves when run.
     SERVER_ENTRY="run_server.py"
     SERVER_DIR="$INSTALL_PATH"
     echo -e "${RED}   No server entry point found under ${INSTALL_PATH}.${NC}"
-    echo -e "${YELLOW}   Expected run_server.py. The install may be incomplete —${NC}"
-    echo -e "${YELLOW}   launchers and the service will point at ${SERVER_DIR}/${SERVER_ENTRY}.${NC}"
+    echo -e "${YELLOW}   Expected run_server.py (Cython release) or server.py (development${NC}"
+    echo -e "${YELLOW}   checkout). The install may be incomplete — launchers and the service${NC}"
+    echo -e "${YELLOW}   will point at ${SERVER_DIR}/${SERVER_ENTRY}.${NC}"
 fi
 
 # Setup the systemd service, and passwordless sudo to restart it
