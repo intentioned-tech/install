@@ -1382,7 +1382,21 @@ else
                 if sudo systemctl restart "$_unit"; then
                     echo -e "${GREEN}   ${_unit} enabled and started ✓${NC}"
                 else
-                    echo -e "${YELLOW}   ${_unit} installed but would not start.${NC}"
+                    echo -e "${RED}   ${_unit} installed but would not start:${NC}"
+                    sudo systemctl status --no-pager --lines=0 "$_unit" 2>&1 |
+                        sed 's/^/      /' | head -10
+                    # A timer cannot start if the unit it triggers will not
+                    # load, and that unit's error is the one worth seeing.
+                    _payload="$(sed -n 's/^[[:space:]]*Unit=//p' "/etc/systemd/system/${_unit}" 2>/dev/null | head -1)"
+                    [ -n "$_payload" ] || _payload="${_unit%.timer}.service"
+                    echo -e "${YELLOW}      triggers ${_payload}:${NC}"
+                    sudo systemctl status --no-pager --lines=0 "$_payload" 2>&1 |
+                        sed 's/^/      /' | head -10
+                    if command_exists systemd-analyze; then
+                        systemd-analyze verify "/etc/systemd/system/${_unit}" 2>&1 |
+                            sed 's/^/      /' | head -10
+                    fi
+                    echo -e "${YELLOW}   Full log: journalctl -u ${_unit} -u ${_payload} -n 50${NC}"
                 fi
             done
 
