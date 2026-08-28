@@ -97,6 +97,10 @@ esac
 USER_BIN="$HOME/.local/bin"
 DESKTOP_DIR="$HOME/.local/share/applications"
 SUDOERS_FILE="/etc/sudoers.d/intentioned-restart"
+# StateDirectory= of intentioned-installer-refresh.service, holding the nightly
+# copy of install.sh. Root-owned and outside INSTALL_PATH by design, so neither
+# the path scan nor the [4/6] rm -rf (which runs unprivileged) would clear it.
+INSTALLER_STATE_DIR="/var/lib/intentioned-installer"
 
 # ---------------------------------------------------------------------------
 # Locate the install
@@ -383,6 +387,12 @@ if [ -f "$SUDOERS_FILE" ]; then
     echo -e "${RED}   $SUDOERS_FILE${NC}"
 fi
 
+if [ -d "$INSTALLER_STATE_DIR" ]; then
+    echo ""
+    echo -e "${YELLOW}Will remove the installer refresh state directory:${NC}"
+    echo -e "${RED}   $INSTALLER_STATE_DIR${NC}"
+fi
+
 if [ "$KEEP_SHELL_RC" != true ]; then
     echo ""
     echo -e "${YELLOW}Will remove the installer's PATH line from ~/.bashrc and ~/.zshrc${NC}"
@@ -491,6 +501,14 @@ if [ -n "$SYSTEM_UNITS$USER_UNITS" ]; then
     echo -e "${GREEN}   Units removed ✓${NC}"
 else
     echo -e "${GREEN}   None found ✓${NC}"
+fi
+
+# Removed here, with the units, rather than in [4/6]: that step runs rm -rf
+# unprivileged and this directory belongs to root. Its only content is a cached
+# copy of install.sh, so there is nothing here worth preserving.
+if [ -d "$INSTALLER_STATE_DIR" ]; then
+    _as_root rm -rf "$INSTALLER_STATE_DIR" &&
+        echo -e "${GREEN}   $INSTALLER_STATE_DIR removed ✓${NC}"
 fi
 
 # 3. Sudoers rule.

@@ -252,14 +252,17 @@ rebuilt, so nothing is re-downloaded.
 | `--help` | Full option list |
 
 Environment equivalents: `INTENTIONED_USERNAME`, `INTENTIONED_PASSWORD`,
-`INTENTIONED_WORKER_URL`, `INSTALL_PATH`, `INSTALL_BACKEND`.
+`INTENTIONED_WORKER_URL`, `INSTALL_PATH`, `INSTALL_BACKEND`. Also
+`INTENTIONED_INSTALLER_URL`, which has no flag — see *Keeping the installer
+current* below.
 
 ### Running as a service
 
 On Linux, the installer finds the `.service` and `.timer` files shipped in the
 release, fills in any placeholders, installs them to `/etc/systemd/system`, and
 enables them so they survive a reboot. That is typically the server, the
-nightly updater, and the timer that drives it:
+nightly updater, and the timer that drives it — plus one pair the installer
+ships itself (see *Keeping the installer current*):
 
 ```bash
 systemctl status intentioned-server.service
@@ -293,6 +296,37 @@ The installed unit names are recorded in `.installed_units` in the install
 directory. `emergency-uninstall.sh` reads that file — as well as matching
 `intentioned*` — so it stops and removes every unit that was installed, even
 one whose name does not match that pattern, along with the sudoers rule.
+
+### Keeping the installer current
+
+The units above come from the release. The installer adds one more pair of its
+own, `intentioned-installer-refresh.service` and its `.timer`, which re-downloads
+**`install.sh` itself** every night at 03:00 — an hour ahead of the release
+updater's own run, so that run is always driven by a current installer.
+
+```bash
+systemctl list-timers intentioned-installer-refresh.timer
+systemctl status intentioned-installer-refresh.service   # last run's outcome
+sudo systemctl start intentioned-installer-refresh.service   # refresh now
+journalctl -u intentioned-installer-refresh.service -n 20
+```
+
+The refreshed copy lands in `/var/lib/intentioned-installer/install.sh`. That is
+deliberately **not** inside the install directory: a release upgrade can swap
+that whole directory aside, which would take the installer with it.
+
+Nothing is executed by the refresh — it only fetches. The download goes to a
+scratch name and is required to be non-empty and to parse under `bash -n`
+before it is renamed into place, so a truncated transfer, a captive-portal
+login page or an HTML error body leaves the previous working copy untouched.
+No licence credentials are involved, and none are stored on disk for it.
+
+`Persistent=true` means a machine that was asleep or powered off at 03:00
+refreshes once it is back rather than skipping the day. Point the fetch
+somewhere else — a fork, a mirror, a test branch — by setting
+`INTENTIONED_INSTALLER_URL` when you run the installer; the value is baked into
+the unit. `--no-systemd-service` skips this pair along with everything else,
+and it is skipped entirely if `curl` is not installed.
 
 ## System dependencies (`install-deps.sh`)
 

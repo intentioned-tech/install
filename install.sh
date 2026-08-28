@@ -30,6 +30,10 @@ SOURCE_MODE="release"
 # this writing; the deployed Worker answers on its workers.dev hostname.
 # Point this at a custom domain once one is created and routed to the Worker.
 WORKER_URL="${INTENTIONED_WORKER_URL:-https://intentioned-license-credentials.jansherremway.workers.dev}"
+# Where the nightly installer refresh re-fetches this script from. Overridable
+# so a fork, a mirror or a test branch can be pointed at without editing the
+# unit by hand afterwards.
+INSTALLER_URL="${INTENTIONED_INSTALLER_URL:-https://raw.githubusercontent.com/intentioned-tech/install/main/install.sh}"
 REL_USERNAME="${INTENTIONED_USERNAME:-}"
 REL_PASSWORD="${INTENTIONED_PASSWORD:-}"
 
@@ -108,13 +112,19 @@ while [[ $# -gt 0 ]]; do
             echo "  --no-config           Skip opening config tool after install"
             echo "  --no-llama-cpp        Skip building llama-cpp-python (GGUF support)"
             echo "  --no-systemd-service  Do not install/enable the intentioned-server systemd"
-            echo "                        service. The 'intentioned' foreground launcher is"
-            echo "                        created either way; this only skips the background"
-            echo "                        daemon. Always skipped on macOS (no systemd)."
+            echo "                        service, nor the 03:00 installer-refresh timer."
+            echo "                        The 'intentioned' foreground launcher is created"
+            echo "                        either way; this only skips the background daemon."
+            echo "                        Always skipped on macOS (no systemd)."
             echo "  --gguf REPO[:FILE]    Configure a GGUF model as the LLM"
             echo "                        e.g. bartowski/Qwen2.5-3B-Instruct-GGUF:*Q4_K_M*.gguf"
             echo "                        or /abs/path/to/file.gguf"
             echo "  -h, --help            Show this help message"
+            echo ""
+            echo "Environment:"
+            echo "  INTENTIONED_INSTALLER_URL  Where the 03:00 installer-refresh timer"
+            echo "                        re-fetches install.sh from. Defaults to the"
+            echo "                        published raw URL on GitHub."
             exit 0
             ;;
         *)
@@ -1231,9 +1241,103 @@ else
         DIST_UNITS="${GENERATED_UNIT_DIR}/${SERVICE_NAME_DEFAULT}"
     fi
 
+    # ── The installer's own units ────────────────────────────────────────────
+    #
+    # The release owns the server and its 04:00 updater. This pair is a
+    # different job: keep install.sh itself current, at 03:00, so the updater an
+    # hour later is always driven by the current installer.
+    #
+    # Written out here rather than shipped as a file beside this script because
+    # the documented way to get the installer is `curl -fsSL .../install.sh`,
+    # which fetches this file and nothing else — a sibling systemd/ directory in
+    # the repo would never travel with it. They are still emitted as templates,
+    # so they go through the same substitution, validation, install and enable
+    # path as the release's units instead of a second code path that drifts.
+    #
+    # Appended after the fallback above, never before: units added here first
+    # would make the "release shipped nothing" branch believe it had units and
+    # skip generating the server service entirely.
+    INSTALLER_UNIT_DIR=""
+    INSTALLER_UNIT_NAMES=""
+    if ! command_exists curl; then
+        echo -e "${YELLOW}   curl not found; skipping the installer refresh timer.${NC}"
+    else
+        INSTALLER_UNIT_DIR="$(mktemp -d)"
+        # Every step is its own ExecStart rather than one `bash -c '...'`: a
+        # Type=oneshot runs them in order and stops at the first failure, and
+        # this avoids both systemd's $VAR expansion (which eats a shell
+        # variable unless doubled) and its line-continuation whitespace rules.
+        cat > "$INSTALLER_UNIT_DIR/intentioned-installer-refresh.service.template" <<'UNIT_TEMPLATE'
+[Unit]
+Description=Refresh the Intentioned installer script
+Documentation=https://github.com/intentioned-tech/install
+# Persistent=true on the timer can fire this seconds after boot, before DHCP
+# has finished. Without the ordering the catch-up run fails on DNS and the
+# machine waits another day for a new installer.
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=@@USER@@
+Group=@@GROUP@@
+# systemd creates and chowns /var/lib/intentioned-installer. The refreshed copy
+# deliberately does not live in @@INSTALL_DIR@@: a release upgrade swaps that
+# whole directory aside (install.sh moves it to .bak when merge-dist.sh is
+# absent), which would carry the installer off with it.
+StateDirectory=intentioned-installer
+# Download to a scratch name, prove it is non-empty and that bash can parse it,
+# and only then rename it into place. A truncated transfer, a captive-portal
+# login page or an HTML error body therefore never replaces a working
+# installer — the run fails and the previous copy stays put.
+ExecStart=@@CURL@@ -fsSL --retry 3 --retry-delay 5 --max-time 120 -o %S/intentioned-installer/install.sh.new @@INSTALLER_URL@@
+ExecStart=/usr/bin/test -s %S/intentioned-installer/install.sh.new
+ExecStart=/bin/bash -n %S/intentioned-installer/install.sh.new
+ExecStart=/bin/chmod 0755 %S/intentioned-installer/install.sh.new
+ExecStart=/bin/mv -f %S/intentioned-installer/install.sh.new %S/intentioned-installer/install.sh
+# Runs after a failed attempt too, so a half-written scratch file is not left
+# to be resumed into the next night's download.
+ExecStopPost=/bin/rm -f %S/intentioned-installer/install.sh.new
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+UNIT_TEMPLATE
+        cat > "$INSTALLER_UNIT_DIR/intentioned-installer-refresh.timer.template" <<'UNIT_TEMPLATE'
+[Unit]
+Description=Refresh the Intentioned installer daily at 03:00
+Documentation=https://github.com/intentioned-tech/install
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+# A machine asleep or powered off at 03:00 refreshes once it is back, rather
+# than silently skipping the day.
+Persistent=true
+AccuracySec=1min
+# Named outright rather than through one of the unit-name placeholders: those
+# resolve to whatever the release ships, which is never this pair.
+Unit=intentioned-installer-refresh.service
+
+[Install]
+WantedBy=timers.target
+UNIT_TEMPLATE
+
+        # _collect_unit skips a unit name already claimed, so a release that
+        # grows its own copy of either of these keeps it and these are dropped.
+        for _uf in "$INSTALLER_UNIT_DIR"/*.template; do
+            _n="$(_unit_name_for "$_uf")"
+            case " $_seen_units " in
+                *" $_n "*) continue ;;
+            esac
+            _collect_unit "$_uf"
+            INSTALLER_UNIT_NAMES="$INSTALLER_UNIT_NAMES $_n"
+        done
+        DIST_UNITS="$(printf '%s\n' $DIST_UNITS | sort)"
+    fi
+
     if [ -n "$DIST_UNITS" ]; then
         if [ -z "$GENERATED_UNIT_DIR" ]; then
-            echo -e "${YELLOW}   Found $(printf '%s\n' "$DIST_UNITS" | wc -l) unit file(s) in the release.${NC}"
+            echo -e "${YELLOW}   $(printf '%s\n' "$DIST_UNITS" | wc -l) unit file(s) to install (release + installer).${NC}"
         fi
 
         # Some placeholders are the name of another unit in the same set — a
@@ -1245,6 +1349,15 @@ else
         UNIT_TIMER_NAME=""
         for _src in $DIST_UNITS; do
             _n="$(_unit_name_for "$_src")"
+            # The installer's own pair is named here, not discovered, and must
+            # not stand in for a release unit. intentioned-installer-refresh
+            # sorts ahead of intentioned-server, so left in it would claim
+            # UNIT_SERVER_NAME and point every @@SERVICE_NAME@@ in the release's
+            # templates at the refresh job — and its timer would likewise
+            # displace the updater's as @@TIMER@@.
+            case " $INSTALLER_UNIT_NAMES " in
+                *" $_n "*) continue ;;
+            esac
             case "$_n" in
                 *updater*.service) [ -n "$UNIT_UPDATER_NAME" ] || UNIT_UPDATER_NAME="$_n" ;;
                 *.timer)           [ -n "$UNIT_TIMER_NAME" ]   || UNIT_TIMER_NAME="$_n" ;;
@@ -1278,6 +1391,8 @@ else
             "UPDATER_SERVICE=${UNIT_UPDATER_NAME}"
             "UPDATER_TIMER=${UNIT_TIMER_NAME}"
             "TIMER=${UNIT_TIMER_NAME}"
+            "CURL=$(command -v curl 2>/dev/null || echo /usr/bin/curl)"
+            "INSTALLER_URL=${INSTALLER_URL}"
         )
 
         for _src in $DIST_UNITS; do
@@ -1441,6 +1556,7 @@ else
         fi
     fi
     [ -n "$GENERATED_UNIT_DIR" ] && rm -rf "$GENERATED_UNIT_DIR"
+    [ -n "$INSTALLER_UNIT_DIR" ] && rm -rf "$INSTALLER_UNIT_DIR"
 
     # The app's config tool restarts the server after a settings change, so the
     # rule covers every long-running service that was actually installed —
