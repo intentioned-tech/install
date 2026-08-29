@@ -963,7 +963,7 @@ fi
 
 if [ -n "$GGUF_MODEL" ]; then
     echo -e "${YELLOW}   Configuring GGUF LLM: ${GGUF_MODEL}${NC}"
-    GGUF_MODEL="$GGUF_MODEL" ./myenv/bin/python - <<'PY'
+    GGUF_MODEL="$GGUF_MODEL" ./myenv/bin/python - <<'PY' || echo -e "${YELLOW}   GGUF model not configured; the rest of the install continues.${NC}"
 import json
 import os
 from pathlib import Path
@@ -976,14 +976,24 @@ path = Path("config.json")
 if path.exists():
     try:
         config = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        config = {}
+    except Exception as exc:
+        # Never fall back to an empty dict here. Everything below writes the
+        # file back out, so starting from {} silently discards every setting
+        # this block does not itself set — including the ones governing user
+        # accounts and authentication, leaving the app on its defaults.
+        raise SystemExit(
+            "   config.json exists but could not be parsed (%s).\n"
+            "   Refusing to overwrite it and lose the settings it holds." % exc
+        )
 else:
     try:
         from config_tool import DEFAULT_CONFIG
-        config = json.loads(json.dumps(DEFAULT_CONFIG))
-    except Exception:
-        config = {}
+    except Exception as exc:
+        raise SystemExit(
+            "   Could not import the application's default configuration (%s).\n"
+            "   Not writing a partial config.json; run 'intentioned-config' instead." % exc
+        )
+    config = json.loads(json.dumps(DEFAULT_CONFIG))
 
 models = config.setdefault("models", {})
 
@@ -1008,7 +1018,7 @@ fi
 
 if [ "$SELECTED_BACKEND" = "rocm" ]; then
     echo -e "${YELLOW}   Configuring ROCm defaults (16bit quantization)...${NC}"
-    ./myenv/bin/python - <<'PY'
+    ./myenv/bin/python - <<'PY' || echo -e "${YELLOW}   ROCm defaults not applied; the rest of the install continues.${NC}"
 import json
 from pathlib import Path
 
@@ -1016,14 +1026,24 @@ path = Path("config.json")
 if path.exists():
     try:
         config = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        config = {}
+    except Exception as exc:
+        # Never fall back to an empty dict here. Everything below writes the
+        # file back out, so starting from {} silently discards every setting
+        # this block does not itself set — including the ones governing user
+        # accounts and authentication, leaving the app on its defaults.
+        raise SystemExit(
+            "   config.json exists but could not be parsed (%s).\n"
+            "   Refusing to overwrite it and lose the settings it holds." % exc
+        )
 else:
     try:
         from config_tool import DEFAULT_CONFIG
-        config = json.loads(json.dumps(DEFAULT_CONFIG))
-    except Exception:
-        config = {}
+    except Exception as exc:
+        raise SystemExit(
+            "   Could not import the application's default configuration (%s).\n"
+            "   Not writing a partial config.json; run 'intentioned-config' instead." % exc
+        )
+    config = json.loads(json.dumps(DEFAULT_CONFIG))
 
 advanced = config.setdefault("advanced", {})
 hardware = config.setdefault("hardware", {})
