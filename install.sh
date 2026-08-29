@@ -17,6 +17,7 @@ OPEN_CONFIG=true
 INSTALL_BACKEND="${INSTALL_BACKEND:-auto}"
 INSTALL_LLAMA_CPP=true
 INSTALL_SYSTEMD_SERVICE=true
+ACTIVATE_LICENSE=true
 GGUF_MODEL=""
 SKIP_REPO_DOWNLOAD=false
 REPO_PATH_CLI=""
@@ -87,6 +88,10 @@ while [[ $# -gt 0 ]]; do
             INSTALL_SYSTEMD_SERVICE=false
             shift
             ;;
+        --no-activate)
+            ACTIVATE_LICENSE=false
+            shift
+            ;;
         --gguf)
             GGUF_MODEL="$2"
             shift 2
@@ -111,6 +116,10 @@ while [[ $# -gt 0 ]]; do
             echo "  --repo-path PATH      With --skip-repo-download only: use this checkout instead of \$PWD"
             echo "  --no-config           Skip opening config tool after install"
             echo "  --no-llama-cpp        Skip building llama-cpp-python (GGUF support)"
+            echo "  --no-activate         Do not activate the licence during install. The app"
+            echo "                        then runs in demo mode (one concurrent user) until"
+            echo "                        activated with: ./myenv/bin/python license_system.py"
+            echo "                        login USERNAME"
             echo "  --no-systemd-service  Do not install/enable the intentioned-server systemd"
             echo "                        service, nor the 03:00 installer-refresh timer."
             echo "                        The 'intentioned' foreground launcher is created"
@@ -1109,6 +1118,92 @@ for _e in "$SERVER_ENTRY" "$CONFIG_ENTRY"; do
     fi
 done
 
+# Activate the licence
+#
+# The credentials that just downloaded the build are the same ones the licence
+# server activates against, so do it here rather than leaving it as a manual
+# step. Without an activation file the server starts in demo mode, which caps
+# it at ONE concurrent session — a freshly installed server that refuses its
+# second user, with nothing on screen to say why.
+#
+# Runs before the service is started below, so the server is licensed the first
+# time it comes up rather than needing a restart.
+# LICENSE_STATE drives the summary at the end of the run, so whichever way this
+# goes the operator is told plainly whether the server is licensed.
+#
+# Seed it from the activation file the app itself reads, so an install re-run on
+# an already-activated server is never told it is unlicensed — including the
+# --no-activate path, which does not go near the licence system at all.
+LICENSE_STATE="unlicensed"
+if grep -q '"active_license"[[:space:]]*:[[:space:]]*"[^"]' \
+        "$SERVER_DIR/license_activation.json" 2>/dev/null; then
+    LICENSE_STATE="active"
+fi
+
+if [ "$ACTIVATE_LICENSE" != true ]; then
+    echo -e "\n${YELLOW}   Skipping licence activation (--no-activate).${NC}"
+elif [ "$LICENSE_STATE" = active ]; then
+    echo -e "\n${GREEN}   Licence already active on this server ✓${NC}"
+elif [ -z "$REL_USERNAME" ] || [ -z "$REL_PASSWORD" ]; then
+    # --skip-repo-download and --from-git never collect credentials. The
+    # summary at the end of the run says how to activate, so no hint here.
+    echo -e "\n${YELLOW}   No licence credentials in this run; skipping activation.${NC}"
+else
+    echo -e "\n${YELLOW}   Activating licence for ${REL_USERNAME}...${NC}"
+    # The password goes through the environment, never argv: /proc/<pid>/cmdline
+    # is world-readable, so an argument would expose it to every local user for
+    # the lifetime of the process.
+    #
+    # The app directory is passed explicitly rather than relying on the cwd the
+    # installer happens to be in: that is what makes the import below resolve to
+    # the app's own license_system — and it writes license_activation.json next
+    # to itself, which is exactly where server.py looks for it.
+    if INTENTIONED_ACT_USER="$REL_USERNAME" INTENTIONED_ACT_PASS="$REL_PASSWORD" \
+       INTENTIONED_APP_DIR="$SERVER_DIR" \
+       "$REPO_PATH/myenv/bin/python" - <<'PY'
+import os
+import sys
+
+sys.path.insert(0, os.environ.get("INTENTIONED_APP_DIR", os.getcwd()))
+try:
+    from license_system import LicenseManager
+except Exception as exc:
+    print(f"   Could not import the licence system ({exc}).")
+    print("   Activate later with: ./myenv/bin/python license_system.py login USERNAME")
+    raise SystemExit(1)
+
+user = os.environ.get("INTENTIONED_ACT_USER", "")
+password = os.environ.get("INTENTIONED_ACT_PASS", "")
+
+manager = LicenseManager()
+# Re-running the installer on an activated server is normal; that is not a
+# failure and must not look like one.
+if manager.is_activated():
+    info = manager.get_activation_info()
+    print(f"   Already activated ({info.get('license_key') or 'this server'}).")
+    raise SystemExit(0)
+
+try:
+    ok, message = manager.activate_with_credentials(user, password)
+except Exception as exc:
+    # A network blip or a licence server outage must not take the install down
+    # with it — the app is installed either way, only the seat count differs.
+    ok, message = False, f"could not reach the licence server ({exc})"
+
+print(("   " if ok else "   Activation failed: ") + str(message))
+if not ok:
+    print("   The app is still installed; it runs in demo mode (one concurrent")
+    print("   user) until it is activated.")
+    print("   Retry with: ./myenv/bin/python license_system.py login " + (user or "USERNAME"))
+raise SystemExit(0 if ok else 1)
+PY
+    then
+        LICENSE_STATE="active"
+    else
+        LICENSE_STATE="unlicensed"
+    fi
+fi
+
 # Setup the systemd service, and passwordless sudo to restart it
 echo -e "\n${YELLOW}[7/8] Setting up systemd units...${NC}"
 CURRENT_USER=$(whoami)
@@ -1773,6 +1868,24 @@ echo "║                                                                ║"
 echo "║  Installation path: $INSTALL_PATH                              "
 echo "╚═══════════════════════════════════════════════════════════════╝"
 echo -e "${NC}"
+
+case "$LICENSE_STATE" in
+    active)
+        echo -e "${GREEN}Licence active — this server is running on its full seat count.${NC}\n"
+        ;;
+    unlicensed)
+        echo -e "${YELLOW}This server is NOT licensed yet, so it will accept only ONE${NC}"
+        echo -e "${YELLOW}concurrent user until it is. Activate it with:${NC}"
+        echo -e "${YELLOW}    cd ${SERVER_DIR} && ./myenv/bin/python license_system.py login USERNAME${NC}"
+        if [ -n "$INSTALLED_SERVICES" ]; then
+            echo -e "${YELLOW}Then restart the service so it picks the licence up:${NC}"
+            for _unit in $INSTALLED_SERVICES; do
+                echo -e "${YELLOW}    sudo systemctl restart ${_unit}${NC}"
+            done
+        fi
+        echo ""
+        ;;
+esac
 
 if [ -n "$INSTALLED_UNITS" ]; then
     echo -e "${CYAN}systemd units installed:${INSTALLED_UNITS}${NC}"
