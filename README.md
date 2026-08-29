@@ -1,3 +1,5 @@
+# STOP!!! BEFORE CONTINUING, PLEASE WATCH THE [INSTALL VIDEO!!!](https://youtu.be/FZNc1lsobXs)
+
 # Intentioned.tech — Installer
 
 Installs [Intentioned.tech](https://intentioned.tech), a local-first, privacy-first,
