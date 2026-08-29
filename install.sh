@@ -1172,6 +1172,44 @@ else
         return 1
     }
 
+    # Units for a DIFFERENT distribution shape than the one this installer
+    # extracts and runs. The Cython release tarball ships every template in
+    # the app repo's shared systemd/ directory verbatim (confirmed directly:
+    # `tar -tf` on a real release shows all of these alongside
+    # intentioned-server-cython.service.template) — not because they apply,
+    # but because the packaging step copies the whole directory. None of the
+    # three below is ever correct here, for three different reasons, so
+    # teaching this generic loop their placeholder names would not fix
+    # anything — it would replace a loud, correct skip with a silently wrong
+    # install:
+    #   - intentioned-server.service: the dev-checkout unit (own header:
+    #     "substituted by systemd/install-services.sh at install time" — a
+    #     different, dedicated installer, not this one). @@PROJECT_DIR@@ here
+    #     names a git checkout root; this installer only ever has a release
+    #     directory.
+    #   - intentioned-server-binary.service: the Nuitka unit, rendered only by
+    #     package_distribution.sh's own @@PREFIX@@ substitution. Its
+    #     WorkingDirectory/ExecStart are @@PREFIX@@/server/... — one directory
+    #     level below where a Cython dist actually puts server.bin (it
+    #     doesn't; there is no server.bin in a Cython release at all).
+    #     Resolving @@PREFIX@@ to this release's own directory would produce a
+    #     syntactically valid unit pointing at a binary that does not exist.
+    #   - intentioned-cloudflare.service: dev-only, and actively hazardous
+    #     alongside either compiled server type — intentioned-server-binary's
+    #     own header: "Do NOT install intentioned-cloudflare.service alongside
+    #     this unit. The compiled server.bin spawns its own cloudflared
+    #     subprocess via TunnelManager. Running both will race on the same
+    #     named tunnel." The same in-process TunnelManager backs the Cython
+    #     build too (CLAUDE.md's Gotchas section).
+    _is_foreign_build_shape() {
+        case "$(basename "$1")" in
+            intentioned-server.service|intentioned-server.service.*| \
+            intentioned-server-binary.service|intentioned-server-binary.service.*| \
+            intentioned-cloudflare.service|intentioned-cloudflare.service.*) return 0 ;;
+        esac
+        return 1
+    }
+
     # Deduplicated by resolved unit name, not by path: with both a rendered
     # foo.service and a foo.service.template present, the bare file is already
     # the output and is taken, since the plain globs are listed first.
@@ -1182,6 +1220,7 @@ else
         [ -f "$_src" ] || return 0
         _is_junk "$_src" && return 0
         _is_manual_opt_in "$_src" && return 0
+        _is_foreign_build_shape "$_src" && return 0
         _name="$(_unit_name_for "$_src")"
         [ -n "$_name" ] || return 0
         case " $_seen_units " in
