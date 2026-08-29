@@ -1149,6 +1149,29 @@ else
         return 1
     }
 
+    # A unit meant to be installed by hand, never by this bulk pass. The
+    # release's own systemd/ directory is a flat, shared folder — the same one
+    # every genuinely-automatic unit ships from — so this generic glob has no
+    # way to tell "install me" from "an operator opts into me on one machine"
+    # apart from naming the exception. intentioned-reboot.service/.timer is the
+    # first such case (see systemd/install-reboot-timer.sh in the app repo:
+    # "Deliberately NOT called by install-cython.sh or install.sh... silently
+    # rebooting every customer's server every night would be a surprise of the
+    # worst kind"). Excluding it here is what actually keeps that promise —
+    # sitting in the shared directory, it was reachable by this discovery loop
+    # the same as any other unit, and only an unrelated missing-placeholder
+    # gap (@@REBOOT_SERVICE@@ not being in _UNIT_VARS) kept the timer from
+    # installing. The service half rendered fine and WAS being installed and
+    # enabled by every affected run before this fix — inert only because
+    # nothing existed to trigger it, not because anything stopped it.
+    _is_manual_opt_in() {
+        case "$(basename "$1")" in
+            intentioned-reboot.service|intentioned-reboot.service.*| \
+            intentioned-reboot.timer|intentioned-reboot.timer.*) return 0 ;;
+        esac
+        return 1
+    }
+
     # Deduplicated by resolved unit name, not by path: with both a rendered
     # foo.service and a foo.service.template present, the bare file is already
     # the output and is taken, since the plain globs are listed first.
@@ -1158,6 +1181,7 @@ else
         local _src="$1" _name
         [ -f "$_src" ] || return 0
         _is_junk "$_src" && return 0
+        _is_manual_opt_in "$_src" && return 0
         _name="$(_unit_name_for "$_src")"
         [ -n "$_name" ] || return 0
         case " $_seen_units " in
