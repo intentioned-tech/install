@@ -4,6 +4,11 @@
 
 set -e
 
+# Everything runs inside main(), invoked on the last line. bash parses the whole
+# function before executing any of it, so a truncated download (`curl | bash`
+# cut off mid-transfer) fails to parse instead of running a partial installer.
+main() {
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -457,6 +462,8 @@ else
 # an absolute one first. A relative --install-path would otherwise produce
 # launchers that only work from the directory the installer happened to run in,
 # and a quoted "~/..." would create a directory literally named ~.
+# Matching a literal, unexpanded "~" is the point here.
+# shellcheck disable=SC2088
 case "$INSTALL_PATH" in
     "~") INSTALL_PATH="$HOME" ;;
     "~/"*) INSTALL_PATH="$HOME/${INSTALL_PATH#\~/}" ;;
@@ -604,6 +611,19 @@ else
     fi
 
     WORKER_URL="${WORKER_URL%/}"
+    # The licence username and password go to this URL as HTTP basic auth, so a
+    # plain-http URL would send them in cleartext. HTTPS is required; plain http
+    # is tolerated only for a loopback Worker (local `wrangler dev`). curl is
+    # also pinned to the same protocol so nothing can downgrade it.
+    case "$WORKER_URL" in
+        https://*) CURL_PROTO="=https" ;;
+        http://localhost|http://localhost[:/]*|http://127.0.0.1|http://127.0.0.1[:/]*)
+            CURL_PROTO="=http,https" ;;
+        *)
+            echo -e "${RED}   Refusing licence server URL '$WORKER_URL': it must be https://.${NC}" >&2
+            exit 1
+            ;;
+    esac
     # Prompt on /dev/tty, not stdin. This script is meant to be runnable as
     # `curl ... | bash`, where stdin IS the script — a bare `read` would swallow
     # the rest of the installer instead of waiting for the operator. If there is
@@ -628,11 +648,22 @@ else
     # world-readable, so a password on the command line leaks to every local user.
     AUTHFILE="$DL_WORK/curl-auth"
     : > "$AUTHFILE"; chmod 600 "$AUTHFILE"
-    printf 'user = "%s:%s"\n' "$REL_USERNAME" "$REL_PASSWORD" >> "$AUTHFILE"
+    # Inside a quoted curl-config value, backslash and double quote are escape
+    # characters; escape them so a password containing either is sent verbatim
+    # and cannot terminate the string and inject further curl options. A newline
+    # would start a new config line, so it is refused outright.
+    case "$REL_USERNAME$REL_PASSWORD" in
+        *$'\n'*|*$'\r'*)
+            echo -e "${RED}   Username and password must not contain line breaks.${NC}" >&2
+            exit 1
+            ;;
+    esac
+    _cfg_esc() { local v="${1//\\/\\\\}"; printf '%s' "${v//\"/\\\"}"; }
+    printf 'user = "%s:%s"\n' "$(_cfg_esc "$REL_USERNAME")" "$(_cfg_esc "$REL_PASSWORD")" >> "$AUTHFILE"
 
     echo -e "${YELLOW}   Checking entitlement: $WORKER_URL/api/v1/update/check${NC}"
     printf '{"current_version":null}' > "$DL_WORK/check-req.json"
-    HTTP="$(curl -sS --retry 3 --max-time 60 -K "$AUTHFILE" \
+    HTTP="$(curl -sS --proto "$CURL_PROTO" --retry 3 --max-time 60 -K "$AUTHFILE" \
         -o "$DL_WORK/check.json" -w '%{http_code}' \
         -H 'content-type: application/json' \
         --data-binary "@$DL_WORK/check-req.json" \
@@ -660,7 +691,7 @@ else
     # between the two calls cannot swap them under the hash we verify next.
     # -C - resumes a partial download rather than restarting a multi-GB transfer.
     echo -e "${YELLOW}   Downloading (resumable)...${NC}"
-    HTTP="$(curl -sS --retry 3 --retry-delay 5 --max-time 3600 -C - -K "$AUTHFILE" \
+    HTTP="$(curl -sS --proto "$CURL_PROTO" --retry 3 --retry-delay 5 --max-time 3600 -C - -K "$AUTHFILE" \
         -o "$DL_WORK/release.tar.zst" -w '%{http_code}' --progress-bar \
         "$WORKER_URL/api/v1/update/download?version=$REL_VERSION" || echo 000)"
     case "$HTTP" in
@@ -669,7 +700,11 @@ else
         *)   echo -e "${RED}   Download failed (HTTP $HTTP).${NC}" >&2; exit 1 ;;
     esac
 
-    if [ -n "$REL_SHA256" ]; then
+    if [ -z "$REL_SHA256" ]; then
+        # Fail closed: an archive that cannot be verified is not unpacked.
+        echo -e "${RED}   Release registry published no sha256 — refusing to install an unverified build.${NC}" >&2
+        exit 1
+    else
         echo -e "${YELLOW}   Verifying checksum...${NC}"
         GOT="$("$PYTHON_BIN" - "$DL_WORK/release.tar.zst" <<'PY'
 import hashlib, sys
@@ -687,8 +722,6 @@ PY
             exit 1
         fi
         echo -e "${GREEN}   Checksum verified ✓${NC}"
-    else
-        echo -e "${YELLOW}   Release registry published no sha256; skipping verification.${NC}"
     fi
 
     # Unpack beside the target and swap, so a failed extraction cannot leave a
@@ -1439,6 +1472,10 @@ else
     INSTALLER_UNIT_NAMES=""
     if ! command_exists curl; then
         echo -e "${YELLOW}   curl not found; skipping the installer refresh timer.${NC}"
+    elif ! [[ "$INSTALLER_URL" =~ ^https://[^[:space:]]+$ ]]; then
+        # Baked into a root-installed unit; must be https and one ExecStart word.
+        echo -e "${YELLOW}   INTENTIONED_INSTALLER_URL must be an https:// URL with no spaces;${NC}"
+        echo -e "${YELLOW}   skipping the installer refresh timer.${NC}"
     else
         INSTALLER_UNIT_DIR="$(mktemp -d)"
         # Every step is its own ExecStart rather than one `bash -c '...'`: a
@@ -1468,7 +1505,7 @@ StateDirectory=intentioned-installer
 # and only then rename it into place. A truncated transfer, a captive-portal
 # login page or an HTML error body therefore never replaces a working
 # installer — the run fails and the previous copy stays put.
-ExecStart=@@CURL@@ -fsSL --retry 3 --retry-delay 5 --max-time 120 -o %S/intentioned-installer/install.sh.new @@INSTALLER_URL@@
+ExecStart=@@CURL@@ -fsSL --proto =https --retry 3 --retry-delay 5 --max-time 120 -o %S/intentioned-installer/install.sh.new @@INSTALLER_URL@@
 ExecStart=/usr/bin/test -s %S/intentioned-installer/install.sh.new
 ExecStart=/bin/bash -n %S/intentioned-installer/install.sh.new
 ExecStart=/bin/chmod 0755 %S/intentioned-installer/install.sh.new
@@ -1584,6 +1621,9 @@ UNIT_TEMPLATE
                 # the placeholder in place lets the check below report it, rather
                 # than substituting nothing and installing a broken unit.
                 [ -n "$_v" ] || continue
+                # Escape what is special in a sed replacement (\\, & and the #
+                # delimiter) so a path or URL is substituted literally.
+                _v="$(printf '%s' "$_v" | sed -e 's/[\\&#]/\\&/g')"
                 # Doubled delimiters first. @@VAR@@ is what these templates
                 # use, and matching the single form against it consumes only
                 # the inner pair — leaving User=@administrator@ and
@@ -1748,7 +1788,7 @@ UNIT_TEMPLATE
             _sudo_cmds="${_sudo_cmds}, /usr/bin/systemctl restart ${_unit}"
         done
         TEMP_SUDOERS=$(mktemp)
-        echo "${CURRENT_USER} ALL=(ALL) NOPASSWD:${_sudo_cmds#,}" > "$TEMP_SUDOERS"
+        echo "${CURRENT_USER} ALL=(root) NOPASSWD:${_sudo_cmds#,}" > "$TEMP_SUDOERS"
 
         if sudo visudo -cf "$TEMP_SUDOERS" > /dev/null 2>&1; then
             sudo install -o root -g root -m 0440 "$TEMP_SUDOERS" "$SUDOERS_FILE"
@@ -1916,3 +1956,7 @@ if [ "$OPEN_CONFIG" = true ]; then
 fi
 
 echo -e "\n${CYAN}Thank you for installing Intentioned.tech!${NC}"
+
+}
+
+main "$@"

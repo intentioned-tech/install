@@ -13,6 +13,11 @@
 
 set -e
 
+# Everything runs inside main(), invoked on the last line. bash parses the whole
+# function before executing any of it, so a truncated download (`curl | bash`
+# cut off mid-transfer) fails to parse instead of running a partial script.
+main() {
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -128,17 +133,40 @@ fi
 # Refuse to delete anything that is not clearly a private subdirectory. A
 # mistyped --install-path must not turn this into `rm -rf $HOME`, so require an
 # absolute path at least two levels deep and never equal to $HOME.
+#
+# The string compare alone was bypassable: "$HOME/", "$HOME/." or
+# "$HOME/x/.." all differ from "$HOME" as strings yet name the same directory.
+# Trailing slashes are stripped, "." / ".." / empty components are refused, and
+# $HOME or any ancestor of it (by its literal and its resolved path) is refused.
+_HOME_REAL="$(cd "$HOME" 2>/dev/null && pwd -P || printf '%s' "$HOME")"
 path_is_safe() {
-    local p="$1"
+    local p="$1" _h
     [ -n "$p" ] || return 1
     case "$p" in /*) ;; *) return 1 ;; esac
-    [ "$p" != "/" ] || return 1
-    [ "$p" != "$HOME" ] || return 1
+    while [ "${p%/}" != "$p" ]; do p="${p%/}"; done
+    [ -n "$p" ] || return 1
+    case "$p/" in */./*|*/../*|*//*) return 1 ;; esac
+    for _h in "${HOME%/}" "${_HOME_REAL%/}"; do
+        [ -n "$_h" ] || continue
+        case "$_h/" in "$p"/*) return 1 ;; esac
+    done
     [ "$(printf '%s' "${p#/}" | tr -cd '/' | wc -c)" -ge 1 ] || return 1
     return 0
 }
 
-if ! path_is_safe "$INSTALL_PATH"; then
+# INSTALL_PATH is also checked by where it actually resolves, so a symlinked or
+# otherwise aliased spelling of $HOME cannot slip past the string checks.
+install_path_is_safe() {
+    local _real
+    path_is_safe "$1" || return 1
+    if [ -d "$1" ]; then
+        _real="$(cd "$1" 2>/dev/null && pwd -P)" || return 1
+        path_is_safe "$_real" || return 1
+    fi
+    return 0
+}
+
+if ! install_path_is_safe "$INSTALL_PATH"; then
     echo -e "${RED}Refusing to operate on install path: '${INSTALL_PATH}'${NC}"
     echo -e "${YELLOW}Pass an absolute path at least two levels deep, e.g.${NC}"
     echo -e "${YELLOW}  --install-path \$HOME/.local/share/intentioned${NC}"
@@ -182,9 +210,17 @@ if [ "$PLATFORM" = "Linux" ] && command_exists systemctl; then
     # The units come from the release, so their names are not guaranteed to
     # match intentioned*. install.sh records exactly what it installed; fold
     # that in so a differently-named unit is not left running afterwards.
+    #
+    # That file sits in a user-writable directory, and each name in it is later
+    # handed to a root `rm -f /etc/systemd/system/<name>` — so only plain unit
+    # names are accepted, never anything carrying a path separator.
     if [ -r "$INSTALL_PATH/.installed_units" ]; then
         while IFS= read -r _u; do
             [ -n "$_u" ] || continue
+            if ! [[ "$_u" =~ ^[A-Za-z0-9][A-Za-z0-9@._:-]*\.(service|timer)$ ]]; then
+                echo -e "${YELLOW}Ignoring invalid unit name in .installed_units: '${_u}'${NC}" >&2
+                continue
+            fi
             case " $SYSTEM_UNITS " in
                 *" $_u "*) ;;
                 *) SYSTEM_UNITS="$SYSTEM_UNITS $_u" ;;
@@ -451,7 +487,7 @@ if [ "$ASSUME_YES" != true ]; then
     echo ""
     echo -e "${RED}This cannot be undone. Session recordings and your configuration go too.${NC}"
     echo -e "${CYAN}Type UNINSTALL to proceed:${NC}"
-    read -r _confirm
+    read -r _confirm || true
     if [ "$_confirm" != "UNINSTALL" ]; then
         echo -e "${YELLOW}Aborted. Nothing was removed.${NC}"
         exit 0
@@ -619,3 +655,7 @@ if [ "$CURL_REMOVED" = true ]; then
     echo -e "${RED}curl is gone. Reinstall it before trying to fetch install.sh again.${NC}"
 fi
 echo -e "${CYAN}Open a new shell to drop the removed PATH entry.${NC}"
+
+}
+
+main "$@"
