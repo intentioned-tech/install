@@ -18,6 +18,11 @@
 
 set -e
 
+# Everything runs inside main(), invoked on the last line. bash parses the whole
+# function before executing any of it, so a truncated download (`curl | bash`
+# cut off mid-transfer) fails to parse instead of running a partial script.
+main() {
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -339,7 +344,7 @@ add_nvidia_repo() {
     case "$PKG" in
         apt)
             tmp="$(mktemp -d)"
-            curl -fsSL -o "$tmp/cuda-keyring.deb" "$base/cuda-keyring_1.1-1_all.deb" || {
+            curl -fsSL --proto '=https' --tlsv1.2 -o "$tmp/cuda-keyring.deb" "$base/cuda-keyring_1.1-1_all.deb" || {
                 rm -rf "$tmp"; return 1
             }
             _as_root dpkg -i "$tmp/cuda-keyring.deb" >/dev/null 2>&1 || { rm -rf "$tmp"; return 1; }
@@ -412,7 +417,8 @@ echo ""
 
 if [ "$ASSUME_YES" != true ] && [ "$DRY_RUN" != true ]; then
     echo -e "${CYAN}Install these packages? (Y/n)${NC}"
-    read -r _resp
+    # Prefer the terminal: under `curl | bash` stdin is the script itself.
+    read -r _resp < /dev/tty 2>/dev/null || read -r _resp || true
     if [[ "$_resp" =~ ^[Nn]$ ]]; then
         echo -e "${YELLOW}Aborted.${NC}"
         exit 0
@@ -565,3 +571,7 @@ fi
 
 echo -e "${GREEN}All dependencies present ✓${NC}"
 echo -e "${CYAN}Next: bash install.sh${NC}"
+
+}
+
+main "$@"
