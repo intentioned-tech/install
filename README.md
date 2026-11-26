@@ -226,6 +226,43 @@ bash install.sh
 Prefer the environment variables over `--username` / `--password`: process
 arguments are visible to every local user through `/proc`.
 
+## After installing: create your first account
+
+The app has **no sign-up page**. Nobody can create an account over the
+network — not even the first visitor — so a fresh install has no accounts
+until you make one on the machine itself. Your licence username is not an app
+account; it only downloads and activates the build.
+
+Create the first admin from the install directory:
+
+```bash
+cd ~/.local/share/intentioned
+./myenv/bin/python run_user_admin.py create <your-name> --role ADMIN
+```
+
+It prints a random password and the account's **Nuclear PIN** once, in that
+terminal, and nowhere else. Store both: the PIN is needed to delete the
+account and its data. The server reads accounts from disk on every sign-in,
+so there is no need to restart it.
+
+Make further accounts the same way, without `--role ADMIN` (they default to
+`USER`).
+
+Sign-ins expire after 24 hours, enforced by the server, so expect to sign in
+again each day. After the update that introduced this, everyone signs in once
+more.
+
+### Age verification
+
+The app is for adults only. Its age check is an on-device ID scan plus a face
+match; nothing is sent to a third party. For now it is **not enforced** by
+default: signed-in users go straight to the app. To enforce it, set
+`INTENTIONED_AGE_GATE_ENFORCE=1` in the server's environment (for the systemd
+service, `sudo systemctl edit intentioned-server.service` and add
+`Environment=INTENTIONED_AGE_GATE_ENFORCE=1` under `[Service]`) and restart.
+With enforcement on and the ID scan not yet configured, every session is
+refused — that is deliberate, not a fault.
+
 ## Options
 
 ### Where things go
